@@ -42,6 +42,16 @@ implementation("com.highcapable.kavaref:kavaref-core:<version>")
 
 Please change `<version>` to the version displayed at the top of this document.
 
+::: danger
+
+Since `1.1.0`, in order to be compatible with the differences in binary files distributed for each platform,
+`KavaRef` introduced a new base module. When updating to this version,
+you must choose a platform-related base module as a dependency, otherwise it will cause a `NoClassDefFoundError` exception.
+
+For the Android platform, please choose [kavaref-android](kavaref-android.md), and for the JVM platform, please choose [kavaref-jvm](kavaref-jvm.md).
+
+:::
+
 ## Function Introduction
 
 You can view the KDoc [click here](kdoc://kavaref-core).
@@ -245,7 +255,8 @@ to set the current instance. If the reflection is a static member, you do not ne
 
 ::: warning
 
-The `Any.resolve()` function has been deprecated in version `1.0.1` because it pollutes the namespace (for example `File.resolve("/path/to/file")`), and now use `Any.asResolver()` instead.
+The `Any.resolve()` function has been deprecated in version `1.0.1` and removed in version `1.0.2`,
+because it pollutes the namespace (for example `File.resolve("/path/to/file")`), and now use `Any.asResolver()` instead.
 
 :::
 
