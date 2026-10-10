@@ -76,6 +76,15 @@ ClassLoaderProvider.classLoader = MyCustomClassLoader()
 
 You can also manually pass a `ClassLoader` parameter to the `toClass` method to specify which `ClassLoader` to use.
 
+If no `ClassLoader` is passed in and `ClassLoaderProvider.classLoader` is not set, the `ClassLoader` that loaded KavaRef will be used.
+
+::: tip
+
+The `toClass` method does not initialize the `Class` by default (its static initializers will not be executed),
+if you need to initialize it, please set `initialize = true`.
+
+:::
+
 #### Class Object Reference
 
 Referring to a Java Class in Kotlin requires writing a very long statement,
@@ -131,10 +140,24 @@ val mySuperClass = MyClass::class.createInstanceAsType<MySuperClass>("Hello", 12
 val mySuperClassOrNull = MyClass::class.createInstanceAsTypeOrNull<MySuperClass>("Hello", 123)
 ```
 
+If more than one constructor can accept the parameters, KavaRef refers to Java's overload rules,
+constructors that match without unboxing are preferred, and then the one with the most specific parameter types is used.
+
+> The following example
+
+```kotlin
+// Assume that MyClass has both MyClass(Object) and MyClass(String) constructors.
+// MyClass(String) will be used here.
+val myClass = MyClass::class.createInstance("Hello")
+```
+
 ::: tip
 
 After the `createInstance` method is successfully matched once, it will cache the results to prevent performance losses
 caused by duplicated reflections. It is thread-safe and you can use it in any standard scenario with confidence.
+
+The cache does not prevent the `Class` and its `ClassLoader` from being collected,
+so you can also use it in scenarios such as plugins that load and unload `ClassLoader` dynamically.
 
 :::
 
@@ -144,6 +167,9 @@ When you pass in a parameter with `null`, KavaRef tries to use it as part of the
 
 The `createInstance` method does not allow all parameters to be `null` (the conditions are completely vague),
 and an exception will be thrown directly because this situation cannot be determined which instance to create.
+
+If there is no single constructor with the most specific parameter types (for example, a `null` parameter makes multiple constructors indistinguishable),
+an exception will also be thrown directly instead of choosing one of them at random.
 
 :::
 
@@ -167,6 +193,8 @@ val myClass = VariousClass("com.example.a", "com.example.b").load()
 // instead of throwing an exception if Class is not found.
 val myClassOrNull = VariousClass("com.example.a", "com.example.b").loadOrNull()
 ```
+
+`VariousClass` uses the same `ClassLoader` as the `toClass` method when loading `Class`.
 
 #### Lazy Loading Class Object
 
@@ -264,6 +292,19 @@ val clazz = type.toClass()
 val clazzOrNull = type.toClassOrNull()
 ```
 
+`toClass` also supports generic arrays (`GenericArrayType`), and the array dimensions are preserved during conversion.
+
+> The following example
+
+```kotlin
+// Assume this is the Type of List<String>[].
+val genericArrayType: GenericArrayType
+// This will be java.util.List[].
+val arrayClass = genericArrayType.toClass()
+```
+
+Type variables (`TypeVariable`) and wildcard types (`WildcardType`) have no definite `Class`, so converting them will throw an exception.
+
 You can also convert `Type` that meets the requirements to `ParameterizedType` object.
 
 > The following example
@@ -290,9 +331,9 @@ val arguments = myClass.genericSuperclassTypeArguments()
 
 ### Type Reference Extension
 
-In Java, method generics are erased after compilation, and the type obtained at runtime is `java.lang.Object`.
+In Java, generics are erased after compilation, so you cannot get the generic arguments of an object directly at runtime.
 
-KavaRef provides the `TypeRef` class to wrap your target generics to ensure that you can get the correct generic type at runtime.
+KavaRef provides the `TypeRef` class, which keeps the complete type information through the generic signature of an anonymous subclass.
 Its core functionality is referenced from [Gson](https://github.com/google/gson)'s `TypeToken`.
 
 It is very simple to use, you can use it like this.
@@ -307,6 +348,17 @@ val type = listStringType.type
 val rawType = listStringType.rawType
 ```
 
+`rawType` also supports generic arrays and preserves the array dimensions.
+
+> The following example
+
+```kotlin
+// This will be java.util.List[].
+val arrayRawType = typeRef<Array<List<String>>>().rawType
+// Multidimensional arrays work too, this will be java.util.List[][].
+val nestedArrayRawType = typeRef<Array<Array<List<String>>>>().rawType
+```
+
 In scenarios where you need to pass in `Type` such as when using Gson, you can implement an extension method with `reified` generics for this purpose.
 
 > The following example
@@ -314,11 +366,46 @@ In scenarios where you need to pass in `Type` such as when using Gson, you can i
 ```kotlin
 val gson = Gson()
 
-inline fun <reified T : Any> T.toJson(): String = gson.toJson(this, typeRef<T>().type)
+inline fun <reified T> T.toJson(): String = gson.toJson(this, typeRef<T>().type)
 
 // Usage
 val json = listOf("KavaRef", "is", "awesome").toJson()
 ```
+
+::: warning
+
+`TypeRef` holds a Java `Type`, which does not contain Kotlin nullability,
+so `typeRef<String?>()` and `typeRef<String>()` are equal, and the same goes for `List<String?>?`.
+
+If you need to distinguish nullability, please use Kotlin's `typeOf<T>()` to get a `KType`.
+
+:::
+
+::: danger
+
+`TypeRef` can only be inherited directly, such as `object : TypeRef<List<String>>() {}`.
+If you inherit from a subclass of `TypeRef`, an exception will be thrown when getting `type` or `rawType`.
+
+:::
+
+When you create a `TypeRef` in a generic method without `reified`, the generic argument will not be replaced with the type passed in by the caller.
+
+> The following example
+
+```kotlin
+fun <T> createTypeRef() = object : TypeRef<T>() {}
+
+val typeRef = createTypeRef<String>()
+// You will get the type variable T instead of String.
+val type = typeRef.type
+// T has no definite Class, so an exception will be thrown here.
+val rawType = typeRef.rawType
+```
+
+Types that have their own raw class such as `List<T>` are not affected, and `rawType` is still `List`,
+but the `rawType` of `T` and `Array<T>` cannot be obtained.
+
+So, please try to use `typeRef<T>()` in methods with `reified` generics.
 
 ### Java Wrapper Classes Extension
 

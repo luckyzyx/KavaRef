@@ -27,7 +27,7 @@ import kotlin.reflect.KClass
 /**
  * You can fill this type in the reflection lookup condition as a placeholder.
  *
- * It is a vague type that you can use when the signature of the JVM type is too long and does not want to declare a type.
+ * It is a vague type that you can use when the signature of the JVM type is too long, and you do not want to declare the type.
  *
  * Usage:
  *
@@ -40,13 +40,14 @@ import kotlin.reflect.KClass
  *    name = "a"
  *    parameters(String::class, VagueType, Int::class)
  * }
+ * ```
  */
 object VagueType {
 
     private const val TAG = "VagueType"
 
     /**
-     * Format the placeholder to a string.
+     * Formats the placeholder to a string.
      * @param placeholder the placeholder to be formatted.
      * @return [String]
      */

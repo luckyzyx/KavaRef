@@ -36,25 +36,26 @@ import java.lang.reflect.Member
  * 
  * [T] to specify the declaring class type of the member.
  */
-abstract class MemberCondition<M : Member, R : MemberResolver<M, T>, T : Any> {
+abstract class MemberCondition<M : Member, R : MemberResolver<M, T, *>, T : Any> {
 
     /**
-     * Configure initial conditions.
+     * Configures initial conditions.
      * @param declaringClass the class that declares the member.
      * @param memberInstance the instance of the resolved member, default is null.
      * @param processorResolver the resolver for processing members, if set,
      * it will be used to resolve members instead of the default resolver.
      * If you want to change the global processor resolver, you can set it using [MemberProcessor.globalResolver].
      * @param superclass the superclass mode, which means that when the condition cannot find the corresponding member,
-     * it will search the [declaringClass]'s superclass, default is false.
+     * it will search the [declaringClass]'s superclasses (and interfaces), default is [Superclass.NO].
+     * It applies to every condition built with this configuration, use [MemberCondition.superclass] to enable it for a single condition.
      * @param optional the optional mode, which means that when the condition cannot find the corresponding member,
-     * do not throw an exception or do not print any logs, but return an empty list, default is [Optional.NO].
+     * do not throw an exception but return an empty list, whether to print logs depends on [Optional], default is [Optional.NO].
      */
     data class Configuration<T : Any>(
         val declaringClass: Class<T>,
         val memberInstance: T? = null,
         var processorResolver: MemberProcessor.Resolver? = null,
-        var superclass: Boolean = false,
+        var superclass: Superclass = Superclass.NO,
         var optional: Optional = Optional.NO
     ) {
 
@@ -62,26 +63,43 @@ abstract class MemberCondition<M : Member, R : MemberResolver<M, T>, T : Any> {
          * Optional mode for handling member resolution.
          */
         enum class Optional {
-            /** Do not use optional mode. */
+            /** Does not use optional mode. */
             NO,
 
             /**
-             * Enable optional mode to minimize exception prompts (do not throw
+             * Enables optional mode to minimize exception prompts (does not throw
              * exceptions), but the warning log will still be printed.
              */
             NOTICE,
 
             /**
-             * Enable optional mode to minimize exception prompts (do not throw
-             * exceptions) and do not print any logs.
+             * Enables optional mode to minimize exception prompts (does not throw
+             * exceptions) and does not print any logs.
              */
             SILENT
+        }
+
+        /**
+         * Superclass mode for searching members in the inheritance hierarchy.
+         */
+        enum class Superclass {
+            /** Does not use superclass mode. */
+            NO,
+
+            /** Searches the superclasses until `java.lang.Object` (including `java.lang.Object` itself). */
+            NORMAL,
+
+            /**
+             * Searches the superclasses like [NORMAL], then searches all the interfaces,
+             * a sub-interface is always searched before its super-interfaces.
+             */
+            INCLUDE_INTERFACES
         }
 
         companion object {
 
             /**
-             * Create a new instance of [Configuration].
+             * Creates a new instance of [Configuration].
              * @return [Configuration]
              */
             @JvmStatic
@@ -89,7 +107,7 @@ abstract class MemberCondition<M : Member, R : MemberResolver<M, T>, T : Any> {
             fun <T : Any> Class<T>.createConfiguration(
                 memberInstance: T? = null,
                 processorResolver: MemberProcessor.Resolver? = null,
-                superclass: Boolean = false,
+                superclass: Superclass = Superclass.NO,
                 optional: Optional = Optional.NO
             ) = Configuration(declaringClass = this, memberInstance, processorResolver, superclass, optional)
         }
@@ -97,11 +115,20 @@ abstract class MemberCondition<M : Member, R : MemberResolver<M, T>, T : Any> {
 
     /**
      * The configuration of this condition,
-     * user can only set by [build] function.
+     * which can only be set by the [build] function.
      */
     @get:JvmSynthetic
     @set:JvmSynthetic
     internal var configuration: Configuration<T>? = null
+
+    /** The superclass mode set by [superclass] for this condition only. */
+    @get:JvmSynthetic
+    @set:JvmSynthetic
+    internal var superclassMode = Configuration.Superclass.NO
+
+    /** The names of the empty conditions that have been set. */
+    @get:JvmSynthetic
+    internal val emptyConditions = mutableSetOf<String>()
 
     /** @see Member.getName */
     var name: String? = null
@@ -181,6 +208,16 @@ abstract class MemberCondition<M : Member, R : MemberResolver<M, T>, T : Any> {
         this.annotationsNot.addAll(annotations.toList())
     }
 
+    /** @see AnnotatedElement.getDeclaredAnnotations */
+    open fun emptyAnnotations() = apply {
+        emptyConditions += EMPTY_ANNOTATIONS
+    }
+
+    /** @see AnnotatedElement.getDeclaredAnnotations */
+    open fun emptyAnnotationsNot() = apply {
+        emptyConditions += EMPTY_ANNOTATIONS_NOT
+    }
+
     /**
      * @see Executable.toGenericString
      * @see Field.toGenericString
@@ -190,15 +227,30 @@ abstract class MemberCondition<M : Member, R : MemberResolver<M, T>, T : Any> {
     }
 
     /**
-     * Enable superclass mode.
-     * @see Configuration.superclass
+     * Enables superclass mode for this condition only.
+     *
+     * It does not affect other conditions created from the same scope.
+     * @see Configuration.Superclass.NORMAL
      */
     open fun superclass() = apply {
-        configuration?.superclass = true
+        superclassMode = maxOf(superclassMode, Configuration.Superclass.NORMAL)
     }
 
     /**
-     * Initialize the copied data from this condition to the new condition.
+     * Enables superclass mode for this condition only.
+     *
+     * It does not affect other conditions created from the same scope.
+     * @param interfaces whether to search all the interfaces after the superclasses.
+     * @see Configuration.Superclass.NORMAL
+     * @see Configuration.Superclass.INCLUDE_INTERFACES
+     */
+    open fun superclass(interfaces: Boolean) = apply {
+        val mode = if (interfaces) Configuration.Superclass.INCLUDE_INTERFACES else Configuration.Superclass.NORMAL
+        superclassMode = maxOf(superclassMode, mode)
+    }
+
+    /**
+     * Initializes the copied data from this condition to the new condition.
      * @param newSelf the new condition instance.
      */
     protected open fun initializeCopiedData(newSelf: MemberCondition<M, R, T>) {
@@ -206,16 +258,19 @@ abstract class MemberCondition<M : Member, R : MemberResolver<M, T>, T : Any> {
         newSelf.nameCondition = nameCondition
         newSelf.modifiers.addAll(modifiers)
         newSelf.modifiersNot.addAll(modifiersNot)
+        newSelf.modifiersCondition = modifiersCondition
         newSelf.isSynthetic = isSynthetic
         newSelf.isSyntheticNot = isSyntheticNot
         newSelf.annotations.addAll(annotations)
         newSelf.annotationsNot.addAll(annotationsNot)
         newSelf.genericString = genericString
+        newSelf.superclassMode = superclassMode
+        newSelf.emptyConditions.addAll(emptyConditions)
     }
 
     /**
-     * Initialize the merged data from this condition to the new condition.
-     * @param other the other condition instance to merge with.
+     * Merges the data set in the [other] condition into this condition.
+     * @param other the other condition instance to merge from.
      */
     @JvmSynthetic
     internal open fun initializeMergedData(other: MemberCondition<M, R, T>) {
@@ -229,6 +284,7 @@ abstract class MemberCondition<M : Member, R : MemberResolver<M, T>, T : Any> {
             modifiersNot.clear()
             modifiersNot.addAll(it)
         }
+        other.modifiersCondition?.let { modifiersCondition = it }
         other.isSynthetic?.let { isSynthetic = it }
         other.isSyntheticNot?.let { isSyntheticNot = it }
         other.annotations.takeIf { it.isNotEmpty() }?.let {
@@ -240,27 +296,29 @@ abstract class MemberCondition<M : Member, R : MemberResolver<M, T>, T : Any> {
             annotationsNot.addAll(it)
         }
         other.genericString?.let { genericString = it }
+        superclassMode = maxOf(superclassMode, other.superclassMode)
+        emptyConditions.addAll(other.emptyConditions)
     }
 
     /**
-     * Create a copy of this condition.
+     * Creates a copy of this condition.
      * @return [MemberCondition]<[M], [R], [T]>
      */
     abstract fun copy(): MemberCondition<M, R, T>
 
     /**
-     * Build the condition with the given [configuration].
+     * Builds the condition with the given [configuration].
      *
-     * - Note: If you are not a manually created condition instance, then you cannot set [configuration] again.
-     * @param configuration the class that declares the member.
+     * - Note: If this condition is not created manually, then you cannot set [configuration] again.
+     * @param configuration the configuration to build the condition with.
      * @return [List]<[R]>
      */
     @JvmOverloads
     open fun build(configuration: Configuration<T>? = null): List<R> =
-        TODO("Implemented build function in subclass.")
+        TODO("Implement the build function in a subclass.")
 
     /**
-     * Get the condition string map.
+     * Gets the condition string map.
      * @return [Map]<[String], [Any] or null>
      */
     @get:JvmSynthetic
@@ -274,8 +332,18 @@ abstract class MemberCondition<M : Member, R : MemberResolver<M, T>, T : Any> {
         IS_SYNTHETIC_NOT to isSyntheticNot,
         ANNOTATIONS to annotations,
         ANNOTATIONS_NOT to annotationsNot,
+        EMPTY_ANNOTATIONS to emptyConditionOf(EMPTY_ANNOTATIONS),
+        EMPTY_ANNOTATIONS_NOT to emptyConditionOf(EMPTY_ANNOTATIONS_NOT),
         GENERIC_STRING to genericString
     )
+
+    /**
+     * Gets the display value of the empty condition [name].
+     * @param name the name of the empty condition.
+     * @return [Boolean] or null.
+     */
+    @JvmSynthetic
+    internal fun emptyConditionOf(name: String) = true.takeIf { name in emptyConditions }
 
     companion object {
         const val NAME = "name"
@@ -287,11 +355,13 @@ abstract class MemberCondition<M : Member, R : MemberResolver<M, T>, T : Any> {
         const val IS_SYNTHETIC_NOT = "isSyntheticNot"
         const val ANNOTATIONS = "annotations"
         const val ANNOTATIONS_NOT = "annotationsNot"
+        const val EMPTY_ANNOTATIONS = "emptyAnnotations"
+        const val EMPTY_ANNOTATIONS_NOT = "emptyAnnotationsNot"
         const val GENERIC_STRING = "genericString"
     }
 
     /**
-     * Check if the [configuration] is null and set it.
+     * Checks if the [configuration] is null and sets it.
      * If the [configuration] is not null, throw an exception.
      * @param configuration the configuration to set.
      * @throws IllegalStateException if the [configuration] is not null.
@@ -301,6 +371,8 @@ abstract class MemberCondition<M : Member, R : MemberResolver<M, T>, T : Any> {
             "Configuration already set for this condition \"$javaClass\" of \"${this.configuration}\". " +
                 "To prevent problems, the configuration can only be set once in a condition, " +
                 "otherwise use copy() to reuse the condition."
-        }; this.configuration = configuration
+        }
+
+        this.configuration = configuration
     }
 }

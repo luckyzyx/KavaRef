@@ -15,7 +15,7 @@ project with integrated Kotlin environment dependencies.
 
 ### Configure Repositories
 
-The dependencies of `KavaRef` are published in **Maven Central** and our public repository,
+The dependencies of KavaRef are published in **Maven Central** and our public repository,
 you can use the following method to configure repositories.
 
 We recommend using Kotlin DSL as the Gradle build script language.
@@ -67,7 +67,7 @@ tasks.withType<KotlinJvmCompile>().configureEach {
 }
 ```
 
-## Functional Overview
+## Features Overview
 
 The project is divided into multiple modules. You can choose the module you wish to include as a dependency in your project, but be sure to include the **kavaref-core**
 module and a platform-related base module (**kavaref-android** or **kavaref-jvm**).
@@ -76,7 +76,7 @@ Click the corresponding module below to view detailed feature descriptions.
 
 ::: tip Version Notes
 
-Starting from `1.0.3`, `KavaRef` started using unified versioning for releases.
+Starting from `1.0.3`, KavaRef started using unified versioning for releases.
 In most cases, you only need to pay attention to the same major version.
 You can also refer to the [kavaref-bom](../library/kavaref-bom.md) below to use BOM for unified dependency version management.
 

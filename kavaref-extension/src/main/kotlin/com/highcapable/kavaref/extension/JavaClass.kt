@@ -19,49 +19,172 @@
  *
  * This file is created by fankes on 2025/5/31.
  */
-@file:Suppress("unused", "MemberVisibilityCanBePrivate", "UNCHECKED_CAST", "PLATFORM_CLASS_MAPPED_TO_KOTLIN")
+@file:Suppress("unused", "UNCHECKED_CAST")
 @file:JvmName("ClassUtils")
 
 package com.highcapable.kavaref.extension
 
+import java.lang.ref.WeakReference
 import java.lang.reflect.Constructor
 import java.lang.reflect.Modifier
-import java.util.concurrent.ConcurrentHashMap
+import java.util.WeakHashMap
 import kotlin.reflect.KClass
 import kotlin.reflect.KProperty
 
-/** Definition [ClassLoader] Loading instance function body type. */
+/** The function type that provides a [ClassLoader] instance. */
 private typealias ClassLoaderInitializer = () -> ClassLoader?
 
-/** Structured key for [createInstance] constructor cache. */
-private data class CreateInstanceConstructorCacheKey(
-    val targetClass: Class<*>,
-    val parameterTypes: List<CreateInstanceArgumentType>,
-    val isPublic: Boolean
-)
+/**
+ * The implementation of [createInstance].
+ *
+ * Selects the constructor like Java overload resolution and creates the instance.
+ */
+private object InstanceCreator {
 
-/** Argument type descriptor for [createInstance] constructor cache. */
-private sealed interface CreateInstanceArgumentType {
+    private val primitiveWideningTargets = mapOf<Class<*>, Set<Class<*>>>(
+        JByte.TYPE to setOf(JShort.TYPE, JInteger.TYPE, JLong.TYPE, JFloat.TYPE, JDouble.TYPE),
+        JShort.TYPE to setOf(JInteger.TYPE, JLong.TYPE, JFloat.TYPE, JDouble.TYPE),
+        JCharacter.TYPE to setOf(JInteger.TYPE, JLong.TYPE, JFloat.TYPE, JDouble.TYPE),
+        JInteger.TYPE to setOf(JLong.TYPE, JFloat.TYPE, JDouble.TYPE),
+        JLong.TYPE to setOf(JFloat.TYPE, JDouble.TYPE),
+        JFloat.TYPE to setOf(JDouble.TYPE)
+    )
 
-    /** Null argument marker that preserves position in constructor cache keys. */
-    data object Null : CreateInstanceArgumentType
+    /**
+     * Cache for the selected constructors.
+     *
+     * Nothing in it strongly references the declaring class or the argument classes,
+     * so their [ClassLoader] can still be collected.
+     */
+    private val constructorsCache = WeakHashMap<Class<*>, MutableMap<ArgumentTypes, CachedConstructor>>()
 
-    /** Runtime argument type marker used by constructor cache keys. */
-    data class Runtime(val type: Class<*>) : CreateInstanceArgumentType
+    /**
+     * The argument types of a [create] call, held weakly as a key of [constructorsCache].
+     */
+    private class ArgumentTypes(args: Array<out Any?>, private val isPublic: Boolean) {
+
+        private val types = args.map { arg -> arg?.javaClass?.let { WeakReference(it) } }
+        private val hashCode = args.fold(isPublic.hashCode()) { hash, arg -> 31 * hash + System.identityHashCode(arg?.javaClass) }
+
+        override fun hashCode() = hashCode
+
+        override fun equals(other: Any?) = other is ArgumentTypes && isPublic == other.isPublic &&
+            types.size == other.types.size && types.indices.all { index ->
+                val type = types[index]
+                val otherType = other.types[index]
+
+                if (type == null || otherType == null)
+                    type == null && otherType == null
+                else type.get()?.let { it === otherType.get() } == true
+            }
+    }
+
+    /**
+     * The selected constructor of [constructorsCache].
+     *
+     * It is held weakly and found again by [index] in [Class.getDeclaredConstructors] after being collected,
+     * the found one is only used if the constructors [count] is unchanged, and it passes [get]'s validation,
+     * otherwise the constructor needs to be selected again.
+     */
+    private class CachedConstructor(private val index: Int, private val count: Int, constructor: Constructor<*>) {
+
+        @Volatile
+        private var reference = WeakReference(constructor)
+
+        fun get(declaringClass: Class<*>, isValid: (Constructor<*>) -> Boolean) = reference.get()
+            ?: declaringClass.declaredConstructors.takeIf { it.size == count }?.getOrNull(index)
+                ?.takeIf(isValid)?.also { reference = WeakReference(it) }
+    }
+
+    fun <T : Any> create(declaringClass: Class<T>, args: Array<out Any?>, isPublic: Boolean): T {
+        // If all arguments are null, throw an exception.
+        if (args.isNotEmpty() && args.all { it == null })
+            error("Not allowed to create an instance with all null arguments for $declaringClass")
+
+        val constructor = cachedOrSelect(declaringClass, args, isPublic) ?: throw NoSuchMethodError(
+            "Could not find a suitable constructor for $declaringClass with arguments: ${args.describe()}"
+        )
+        require(constructor.makeAccessible()) {
+            "Failed to make the constructor \"$constructor\" accessible. " +
+                "Please check if the constructor is accessible or if the security manager allows it."
+        }
+
+        return constructor.newInstance(*args) as T
+    }
+
+    private fun cachedOrSelect(declaringClass: Class<*>, args: Array<out Any?>, isPublic: Boolean): Constructor<*>? {
+        val key = ArgumentTypes(args, isPublic)
+        synchronized(constructorsCache) { constructorsCache[declaringClass]?.get(key) }
+            ?.get(declaringClass) { it.isApplicable(args, isPublic) }?.let { return it }
+        val constructors = declaringClass.declaredConstructors
+        val (index, constructor) = select(declaringClass, constructors, args, isPublic) ?: return null
+        synchronized(constructorsCache) {
+            constructorsCache.getOrPut(declaringClass) { HashMap() }[key] = CachedConstructor(index, constructors.size, constructor)
+        }
+
+        return constructor
+    }
+
+    private fun select(
+        declaringClass: Class<*>,
+        constructors: Array<Constructor<*>>,
+        args: Array<out Any?>,
+        isPublic: Boolean
+    ): IndexedValue<Constructor<*>>? {
+        // Read the parameter types only once, because they are copied on every access.
+        val candidates = constructors.withIndex().mapNotNull { constructor ->
+            constructor.value.parameterTypes.takeIf { (!isPublic || constructor.value.isPublic) && it.size == args.size }?.let { constructor to it }
+        }
+        // Same as Java overload resolution: try without unboxing first, then allow unboxing and widening.
+        booleanArrayOf(false, true).forEach { allowUnboxing ->
+            val applicable = candidates.filter { (_, types) -> types.indices.all { types[it].acceptsArgument(args[it], allowUnboxing) } }
+            if (applicable.isEmpty()) return@forEach
+            val mostSpecific = applicable.filter { (_, types) ->
+                applicable.all { (_, otherTypes) -> types === otherTypes || types.isMoreSpecificThan(otherTypes) }
+            }
+
+            return mostSpecific.singleOrNull()?.first ?: throw IllegalArgumentException(
+                "Ambiguous constructors for $declaringClass with arguments: ${args.describe()}, " +
+                    "candidates: ${applicable.joinToString { it.first.value.toString() }}"
+            )
+        }
+
+        return null
+    }
+
+    private fun Constructor<*>.isApplicable(args: Array<out Any?>, isPublic: Boolean) =
+        (!isPublic || this.isPublic) && parameterTypes.let { types ->
+            types.size == args.size && types.indices.all { types[it].acceptsArgument(args[it], allowUnboxing = true) }
+        }
+
+    private fun Class<*>.isWideningTo(target: Class<*>) = this == target || primitiveWideningTargets[this]?.contains(target) == true
+
+    private fun Class<*>.acceptsArgument(arg: Any?, allowUnboxing: Boolean) = when {
+        arg == null -> !isPrimitive
+        isPrimitive -> allowUnboxing && arg.javaClass.kotlin.javaPrimitiveType?.isWideningTo(this) == true
+        else -> isInstance(arg)
+    }
+
+    private fun Class<*>.isMoreSpecificThan(other: Class<*>) = when {
+        isPrimitive && other.isPrimitive -> isWideningTo(other)
+        isPrimitive -> kotlin.javaObjectType isSubclassOf other
+        other.isPrimitive -> false
+        else -> this isSubclassOf other
+    }
+
+    private fun Array<Class<*>>.isMoreSpecificThan(other: Array<Class<*>>) = indices.all { this[it].isMoreSpecificThan(other[it]) }
+    private fun Array<out Any?>.describe() = joinToString().ifBlank { "(empty)" }
 }
 
-/** Cache for [createInstance] function to store constructors for faster access. */
-private val createInstanceConstructorsCache = ConcurrentHashMap<CreateInstanceConstructorCacheKey, Constructor<*>>()
-
 /**
- * Provide a [ClassLoader] for reflection operations.
+ * Provides a [ClassLoader] for reflection operations.
  */
 object ClassLoaderProvider {
 
     /**
      * The [ClassLoader] used for reflection operations.
      *
-     * If null, it will be determined according to the default behavior of the current JVM.
+     * If null, the [ClassLoader] that loaded KavaRef will be used.
      */
     var classLoader: ClassLoader? = null
 }
@@ -75,59 +198,54 @@ class VariousClass(vararg names: String) {
     private val classNames = names.toList()
 
     /**
-     * Load the first class that matches the given names using the specified [ClassLoader].
+     * Loads the first class that matches the given names using the specified [ClassLoader].
      *
      * If no class is found, it throws a [NoClassDefFoundError].
      * @see loadOrNull
-     * @param loader the [ClassLoader] to load the class, default is [ClassLoaderProvider.classLoader].
+     * @param loader the [ClassLoader] to load the class, default is [ClassLoaderProvider.classLoader],
+     * if it is also null, the [ClassLoader] that loaded KavaRef will be used.
      * @param initialize whether to initialize the class with [loader], default is false.
      * @return [Class]
      * @throws NoClassDefFoundError if no class is found.
      */
     @JvmOverloads
     fun load(loader: ClassLoader? = null, initialize: Boolean = false) = loadOrNull(loader, initialize)
-        ?: throw NoClassDefFoundError("VariousClass matches failed of $classNames.")
+        ?: throw NoClassDefFoundError("Failed to match any class of VariousClass $classNames")
 
     /**
-     * Load the first class that matches the given names using the specified [ClassLoader].
+     * Loads the first class that matches the given names using the specified [ClassLoader] and casts it to [Class]<[T]>.
      * @see load
      * @see loadOrNull
      * @return [Class]<[T]>
      * @throws NoClassDefFoundError if no class is found.
-     * @throws IllegalStateException if the class cannot be cast to type [T].
      */
     @JvmOverloads
     @JvmName("loadTyped")
-    fun <T : Any> load(loader: ClassLoader? = null, initialize: Boolean = false) = load(loader, initialize) as? Class<T>?
-        ?: error("VariousClass type cast failed of $classNames.")
+    fun <T : Any> load(loader: ClassLoader? = null, initialize: Boolean = false) = load(loader, initialize) as Class<T>
 
     /**
-     * Load the first class that matches the given names using the specified [ClassLoader].
+     * Loads the first class that matches the given names using the specified [ClassLoader].
      *
      * If no class is found, it returns null.
      * @see load
-     * @param loader the [ClassLoader] to load the class, default is [ClassLoaderProvider.classLoader].
+     * @param loader the [ClassLoader] to load the class, default is [ClassLoaderProvider.classLoader],
+     * if it is also null, the [ClassLoader] that loaded KavaRef will be used.
      * @param initialize whether to initialize the class with [loader], default is false.
      * @return [Class] or null if no class is found.
      */
     @JvmOverloads
-    fun loadOrNull(loader: ClassLoader? = null, initialize: Boolean = false): Class<Any>? {
-        val currentLoader = loader
-            ?: ClassLoaderProvider.classLoader
-            ?: ClassLoader.getSystemClassLoader()
-
-        return classNames.firstOrNull { currentLoader.hasClass(it) }?.toClass(loader, initialize)
-    }
+    fun loadOrNull(loader: ClassLoader? = null, initialize: Boolean = false): Class<Any>? =
+        classNames.firstOrNull { it.toClassOrNull(loader) != null }?.toClass(loader, initialize)
 
     /**
-     * Load the first class that matches the given names using the specified [ClassLoader].
+     * Loads the first class that matches the given names using the specified [ClassLoader] and casts it to [Class]<[T]>.
      * @see load
      * @see loadOrNull
-     * @return [Class]<[T]> or null.
+     * @return [Class]<[T]> or null if no class is found.
      */
     @JvmOverloads
     @JvmName("loadOrNullTyped")
-    fun <T : Any> loadOrNull(loader: ClassLoader? = null, initialize: Boolean = false) = loadOrNull(loader, initialize) as? Class<T>?
+    fun <T : Any> loadOrNull(loader: ClassLoader? = null, initialize: Boolean = false) = loadOrNull(loader, initialize) as Class<T>?
 }
 
 /**
@@ -142,42 +260,48 @@ abstract class LazyClass<T : Any> private constructor(
     private val loader: ClassLoaderInitializer?
 ) {
 
+    @Volatile
     private var baseDefinition: Class<T>? = null
 
+    /** Whether the class is not found, the nullable instance does not try to load it again. */
+    @Volatile
+    private var isMissing = false
+
     /**
-     * Get non-null instance of [Class].
+     * Gets non-null instance of [Class].
      * @return [Class]<[T]>
      */
     @get:JvmSynthetic
-    internal val nonNull get(): Class<T> {
-        if (baseDefinition == null)
-            baseDefinition = when (classDefinition) {
-                is String -> classDefinition.toClass<T>(loader?.invoke(), initialize)
-                is VariousClass -> classDefinition.load<T>(loader?.invoke(), initialize)
-                else -> error("Unknown lazy class type \"$classDefinition\"")
-            }
+    internal val nonNull get(): Class<T> = baseDefinition ?: synchronized(this) {
+        baseDefinition?.let { return@synchronized it }
+        val clazz = when (classDefinition) {
+            is String -> classDefinition.toClass(loader?.invoke(), initialize)
+            is VariousClass -> classDefinition.load(loader?.invoke(), initialize)
+            else -> error("Unknown lazy class type \"$classDefinition\"")
+        }
 
-        return baseDefinition ?: error("Exception has been thrown above.")
+        (clazz as Class<T>).also { baseDefinition = it }
     }
 
     /**
-     * Get nullable instance of [Class].
+     * Gets nullable instance of [Class].
      * @return [Class]<[T]> or null.
      */
     @get:JvmSynthetic
-    internal val nullable get(): Class<T>? {
-        if (baseDefinition == null)
-            baseDefinition = when (classDefinition) {
-                is String -> classDefinition.toClassOrNull<T>(loader?.invoke(), initialize)
-                is VariousClass -> classDefinition.loadOrNull<T>(loader?.invoke(), initialize)
-                else -> error("Unknown lazy class type \"$classDefinition\".")
-            }
+    internal val nullable get(): Class<T>? = baseDefinition ?: if (!isMissing) synchronized(this) {
+        if (isMissing) return@synchronized null
 
-        return baseDefinition
-    }
+        baseDefinition?.let { return@synchronized it }
+        val clazz = when (classDefinition) {
+            is String -> classDefinition.toClassOrNull(loader?.invoke(), initialize)
+            is VariousClass -> classDefinition.loadOrNull(loader?.invoke(), initialize)
+            else -> error("Unknown lazy class type \"$classDefinition\"")
+        }
+        (clazz as Class<T>?).also { if (it != null) baseDefinition = it else isMissing = true }
+    } else null
 
     /**
-     * Create a non-null instance of [Class].
+     * Creates a non-null instance of [Class].
      * @param classDefinition the class definition, can be a [String] class name or a [VariousClass].
      * @param initialize whether to initialize the class with [loader].
      * @param loader the [ClassLoader] to load the class.
@@ -192,7 +316,7 @@ abstract class LazyClass<T : Any> private constructor(
     }
 
     /**
-     * Create a nullable instance of [Class].
+     * Creates a nullable instance of [Class].
      * @param classDefinition the class definition, can be a [String] class name or a [VariousClass].
      * @param initialize whether to initialize the class with [loader].
      * @param loader the [ClassLoader] to load the class.
@@ -208,133 +332,160 @@ abstract class LazyClass<T : Any> private constructor(
 }
 
 /**
- * Create a non-null instance of [Class].
+ * Creates a non-null instance of [Class].
  * @see lazyClassOrNull
  * @param name the fully qualified class name.
  * @param initialize whether to initialize the class with [loader], default is false.
- * @param loader the [ClassLoader] to load the class, default is [ClassLoaderProvider.classLoader].
+ * @param loader the [ClassLoader] to load the class, default is [ClassLoaderProvider.classLoader],
+ * if it is also null, the [ClassLoader] that loaded KavaRef will be used.
  * @return [LazyClass.NonNull]
  */
 @JvmSynthetic
-fun lazyClass(name: String, initialize: Boolean = false, loader: ClassLoaderInitializer? = null) =
-    LazyClass.NonNull<Any>(name, initialize, loader)
+fun lazyClass(
+    name: String,
+    initialize: Boolean = false,
+    loader: ClassLoaderInitializer? = null
+) = LazyClass.NonNull<Any>(name, initialize, loader)
 
 /**
- * Create a non-null instance of [Class].
+ * Creates a non-null instance of [Class].
  * @see lazyClass
  * @see lazyClassOrNull
  * @return [LazyClass.NonNull]<[T]>
  */
 @JvmSynthetic
 @JvmName("lazyClassTyped")
-fun <T : Any> lazyClass(name: String, initialize: Boolean = false, loader: ClassLoaderInitializer? = null) =
-    LazyClass.NonNull<T>(name, initialize, loader)
+fun <T : Any> lazyClass(
+    name: String,
+    initialize: Boolean = false,
+    loader: ClassLoaderInitializer? = null
+) = LazyClass.NonNull<T>(name, initialize, loader)
 
 /**
- * Create a non-null instance of [VariousClass].
+ * Creates a non-null instance of [VariousClass].
  * @see lazyClassOrNull
  * @param variousClass the [VariousClass] to be loaded.
  * @param initialize whether to initialize the class with [loader], default is false.
- * @param loader the [ClassLoader] to load the class, default is [ClassLoaderProvider.classLoader].
+ * @param loader the [ClassLoader] to load the class, default is [ClassLoaderProvider.classLoader],
+ * if it is also null, the [ClassLoader] that loaded KavaRef will be used.
  * @return [LazyClass.NonNull]
  */
 @JvmSynthetic
-fun lazyClass(variousClass: VariousClass, initialize: Boolean = false, loader: ClassLoaderInitializer? = null) =
-    LazyClass.NonNull<Any>(variousClass, initialize, loader)
+fun lazyClass(
+    variousClass: VariousClass,
+    initialize: Boolean = false,
+    loader: ClassLoaderInitializer? = null
+) = LazyClass.NonNull<Any>(variousClass, initialize, loader)
 
 /**
- * Create a non-null instance of [VariousClass].
+ * Creates a non-null instance of [VariousClass].
  * @see lazyClass
  * @see lazyClassOrNull
  * @return [LazyClass.NonNull]<[T]>
  */
 @JvmSynthetic
 @JvmName("lazyClassTyped")
-fun <T : Any> lazyClass(variousClass: VariousClass, initialize: Boolean = false, loader: ClassLoaderInitializer? = null) =
-    LazyClass.NonNull<T>(variousClass, initialize, loader)
+fun <T : Any> lazyClass(
+    variousClass: VariousClass,
+    initialize: Boolean = false,
+    loader: ClassLoaderInitializer? = null
+) = LazyClass.NonNull<T>(variousClass, initialize, loader)
 
 /**
- * Create a nullable instance of [Class].
+ * Creates a nullable instance of [Class].
  * @see lazyClass
  * @param name the fully qualified class name.
  * @param initialize whether to initialize the class with [loader], default is false.
- * @param loader the [ClassLoader] to load the class, default is [ClassLoaderProvider.classLoader].
+ * @param loader the [ClassLoader] to load the class, default is [ClassLoaderProvider.classLoader],
+ * if it is also null, the [ClassLoader] that loaded KavaRef will be used.
  * @return [LazyClass.Nullable]
  */
 @JvmSynthetic
-fun lazyClassOrNull(name: String, initialize: Boolean = false, loader: ClassLoaderInitializer? = null) =
-    LazyClass.Nullable<Any>(name, initialize, loader)
+fun lazyClassOrNull(
+    name: String,
+    initialize: Boolean = false,
+    loader: ClassLoaderInitializer? = null
+) = LazyClass.Nullable<Any>(name, initialize, loader)
 
 /**
- * Create a nullable instance of [Class].
+ * Creates a nullable instance of [Class].
  * @see lazyClass
  * @see lazyClassOrNull
  * @return [LazyClass.Nullable]<[T]>
  */
 @JvmSynthetic
 @JvmName("lazyClassOrNullTyped")
-fun <T : Any> lazyClassOrNull(name: String, initialize: Boolean = false, loader: ClassLoaderInitializer? = null) =
-    LazyClass.Nullable<T>(name, initialize, loader)
+fun <T : Any> lazyClassOrNull(
+    name: String,
+    initialize: Boolean = false,
+    loader: ClassLoaderInitializer? = null
+) = LazyClass.Nullable<T>(name, initialize, loader)
 
 /**
- * Create a nullable instance of [VariousClass].
+ * Creates a nullable instance of [VariousClass].
  * @see lazyClass
  * @param variousClass the [VariousClass] to be loaded.
  * @param initialize whether to initialize the class with [loader], default is false.
- * @param loader the [ClassLoader] to load the class, default is [ClassLoaderProvider.classLoader].
+ * @param loader the [ClassLoader] to load the class, default is [ClassLoaderProvider.classLoader],
+ * if it is also null, the [ClassLoader] that loaded KavaRef will be used.
  * @return [LazyClass.Nullable]
  */
 @JvmSynthetic
-fun lazyClassOrNull(variousClass: VariousClass, initialize: Boolean = false, loader: ClassLoaderInitializer? = null) =
-    LazyClass.Nullable<Any>(variousClass, initialize, loader)
+fun lazyClassOrNull(
+    variousClass: VariousClass,
+    initialize: Boolean = false,
+    loader: ClassLoaderInitializer? = null
+) = LazyClass.Nullable<Any>(variousClass, initialize, loader)
 
 /**
- * Create a nullable instance of [VariousClass].
+ * Creates a nullable instance of [VariousClass].
  * @see lazyClass
  * @see lazyClassOrNull
  * @return [LazyClass.Nullable]<[T]>
  */
 @JvmSynthetic
 @JvmName("lazyClassOrNullTyped")
-fun <T : Any> lazyClassOrNull(variousClass: VariousClass, initialize: Boolean = false, loader: ClassLoaderInitializer? = null) =
-    LazyClass.Nullable<T>(variousClass, initialize, loader)
+fun <T : Any> lazyClassOrNull(
+    variousClass: VariousClass,
+    initialize: Boolean = false,
+    loader: ClassLoaderInitializer? = null
+) = LazyClass.Nullable<T>(variousClass, initialize, loader)
 
 /**
- * Convert [String] class name to [Class] with [ClassLoader] and initialize.
+ * Converts [String] class name to [Class] with [ClassLoader].
  * @see String.toClassOrNull
  * @receiver the class name to be converted.
- * @param loader [ClassLoader] to load the class, default is [ClassLoaderProvider.classLoader].
+ * @param loader [ClassLoader] to load the class, default is [ClassLoaderProvider.classLoader],
+ * if it is also null, the [ClassLoader] that loaded `KavaRef` will be used.
  * @param initialize whether to initialize the class with [loader], default is false.
  * @return [Class]
  */
 @JvmOverloads
 @JvmName("create")
 fun String.toClass(loader: ClassLoader? = null, initialize: Boolean = false): Class<Any> {
-    val createLoader = loader ?: ClassLoaderProvider.classLoader
+    val createLoader = loader ?: ClassLoaderProvider.classLoader ?: ClassLoaderProvider::class.java.classLoader
 
-    return ((if (createLoader != null)
-        Class.forName(this, initialize, createLoader)
-    else Class.forName(this)) ?: error("JVM class not resolved: $this")) as Class<Any>
+    return Class.forName(this, initialize, createLoader) as Class<Any>
 }
 
 /**
- * Convert [String] class name to [Class] with [ClassLoader] and initialize.
+ * Converts [String] class name to [Class] with [ClassLoader], then casts it to [Class]<[T]>.
  * @see Class.toClass
  * @see String.toClassOrNull
  * @return [Class]<[T]>
  */
 @JvmOverloads
 @JvmName("createTyped")
-fun <T : Any> String.toClass(loader: ClassLoader? = null, initialize: Boolean = false) =
-    toClass(loader, initialize) as? Class<T>? ?: error("JVM class type cast failed: $this")
+fun <T : Any> String.toClass(loader: ClassLoader? = null, initialize: Boolean = false) = toClass(loader, initialize) as Class<T>
 
 /**
- * Convert [String] class name to [Class] with [ClassLoader] and initialize.
+ * Converts [String] class name to [Class] with [ClassLoader].
  * @see String.toClassOrNull
  * @receiver the class name to be converted.
- * @param loader [ClassLoader] to load the class, default is [ClassLoaderProvider.classLoader].
+ * @param loader [ClassLoader] to load the class, default is [ClassLoaderProvider.classLoader],
+ * if it is also null, the [ClassLoader] that loaded `KavaRef` will be used.
  * @param initialize whether to initialize the class with [loader], default is false.
- * @return [Class] or null if the class not found.
+ * @return [Class] or null if the class is not found.
  */
 @JvmOverloads
 @JvmName("createOrNull")
@@ -343,20 +494,23 @@ fun String.toClassOrNull(loader: ClassLoader? = null, initialize: Boolean = fals
 }.getOrNull()
 
 /**
- * Convert [String] class name to [Class] with [ClassLoader] and initialize.
+ * Converts [String] class name to [Class] with [ClassLoader], then casts it to [Class]<[T]>.
  * @see Class.toClass
  * @see String.toClassOrNull
- * @return [Class]<[T]> or null if the class not found or type cast failed.
+ * @return [Class]<[T]> or null if the class is not found.
  */
 @JvmOverloads
 @JvmName("createOrNullTyped")
-fun <T : Any> String.toClassOrNull(loader: ClassLoader? = null, initialize: Boolean = false) =
-    toClassOrNull(loader, initialize) as? Class<T>?
+fun <T : Any> String.toClassOrNull(loader: ClassLoader? = null, initialize: Boolean = false) = toClassOrNull(loader, initialize) as Class<T>?
 
 /**
- * Create an instance of [Class] with the given arguments.
+ * Creates an instance of [Class] with the given arguments.
  *
- * - Note: If you give a null argument, it will be treated as an any type value for the constructor parameter,
+ * The constructor is selected like Java overload resolution, constructors that accept the arguments
+ * without unboxing are preferred, otherwise unboxing and primitive widening are allowed,
+ * then the most specific one is used.
+ *
+ * - Note: If you give a null argument, it will be treated as a value of any non-primitive type for the constructor parameter,
  *   but if all arguments are null, it will throw an [IllegalStateException].
  * @see Class.createInstanceOrNull
  * @see Class.createInstanceAsType
@@ -365,63 +519,16 @@ fun <T : Any> String.toClassOrNull(loader: ClassLoader? = null, initialize: Bool
  * @param args the arguments to be passed to the constructor.
  * @param isPublic whether to only consider public constructors, default is true.
  * @return [T]
- * @throws NoSuchMethodException if no suitable constructor is found.
+ * @throws NoSuchMethodError if no suitable constructor is found.
+ * @throws IllegalArgumentException if more than one constructor is the most specific.
  * @throws IllegalStateException if all arguments are null.
  */
 @JvmOverloads
-fun <T : Any> Class<T>.createInstance(vararg args: Any?, isPublic: Boolean = true): T {
-    fun Class<*>.wrap() = when (this) {
-        JBoolean.TYPE -> classOf<JBoolean>(primitiveType = false)
-        JByte.TYPE -> classOf<JByte>(primitiveType = false)
-        JCharacter.TYPE -> classOf<JCharacter>(primitiveType = false)
-        JShort.TYPE -> classOf<JShort>(primitiveType = false)
-        JInteger.TYPE -> classOf<JInteger>(primitiveType = false)
-        JLong.TYPE -> classOf<JLong>(primitiveType = false)
-        JFloat.TYPE -> classOf<JFloat>(primitiveType = false)
-        JDouble.TYPE -> classOf<JDouble>(primitiveType = false)
-        JVoid.TYPE -> classOf<JVoid>(primitiveType = false)
-        else -> this
-    }
-
-    fun filterConstructor() = declaredConstructors.asSequence()
-        .filter { !isPublic || it.isPublic }
-        .filter { it.parameterTypes.size == args.size }.firstOrNull {
-            it.parameterTypes.zip(args).all { (type, arg) ->
-                val isBoxed = arg == null && !type.isPrimitive
-                isBoxed || arg?.javaClass?.isSubclassOf(type.wrap()) == true
-            }
-        }
-
-    fun Constructor<*>?.create() = this?.newInstance(*args) as? T? ?: throw NoSuchMethodError(
-        "Could not find a suitable constructor for $this with arguments: ${args.joinToString().ifBlank { "(empty)" }}."
-    )
-
-    // If all arguments are null, throw an exception.
-    if (args.isNotEmpty() && args.all { it == null })
-        error("Not allowed to create an instance with all null arguments for $this.")
-
-    val constructorKey = CreateInstanceConstructorCacheKey(
-        targetClass = this,
-        parameterTypes = args.map {
-            it?.javaClass?.let(CreateInstanceArgumentType::Runtime) ?: CreateInstanceArgumentType.Null
-        },
-        isPublic = isPublic
-    )
-
-    return createInstanceConstructorsCache[constructorKey]?.create() ?: run {
-        val constructor = filterConstructor()?.also {
-            require(it.makeAccessible()) {
-                "Failed to make the constructor \"$it\" accessible. " +
-                    "Please check if the constructor is accessible or if the security manager allows it."
-            }
-            createInstanceConstructorsCache[constructorKey] = it
-        }
-        constructor.create()
-    }
-}
+fun <T : Any> Class<T>.createInstance(vararg args: Any?, isPublic: Boolean = true) =
+    InstanceCreator.create(this, args, isPublic)
 
 /**
- * Create an instance of [KClass.java] with the given arguments.
+ * Creates an instance of [KClass.java] with the given arguments.
  * @see Class.createInstance
  */
 @JvmSynthetic
@@ -429,21 +536,21 @@ fun <T : Any> KClass<T>.createInstance(vararg args: Any?, isPublic: Boolean = tr
     java.createInstance(*args, isPublic = isPublic)
 
 /**
- * Create an instance of [Class] with the given arguments or return null if not found.
+ * Creates an instance of [Class] with the given arguments or returns null if failed.
  * @see Class.createInstance
  * @see Class.createInstanceAsType
  * @see Class.createInstanceAsTypeOrNull
  * @receiver the [Class] to be instantiated.
  * @param args the arguments to be passed to the constructor.
  * @param isPublic whether to only consider public constructors, default is true.
- * @return [T] or null if no suitable constructor is found.
+ * @return [T] or null if the instance cannot be created.
  */
 @JvmOverloads
 fun <T : Any> Class<T>.createInstanceOrNull(vararg args: Any?, isPublic: Boolean = true) =
     runCatching { createInstance(*args, isPublic = isPublic) }.getOrNull()
 
 /**
- * Create an instance of [KClass.java] with the given arguments or return null if not found.
+ * Creates an instance of [KClass.java] with the given arguments or returns null if failed.
  * @see Class.createInstanceOrNull
  */
 @JvmSynthetic
@@ -451,51 +558,55 @@ fun <T : Any> KClass<T>.createInstanceOrNull(vararg args: Any?, isPublic: Boolea
     java.createInstanceOrNull(*args, isPublic = isPublic)
 
 /**
- * Create an instance of [Class] with the given arguments and cast it to the specified type [T].
+ * Creates an instance of [Class] with the given arguments and casts it to the specified type [T].
  * @see Class.createInstance
  * @see Class.createInstanceOrNull
  * @see Class.createInstanceAsTypeOrNull
  * @return [T]
- * @throws NoSuchMethodException if no suitable constructor is found.
- * @throws IllegalStateException if the instance cannot be cast to type [T] or if all arguments are null.
+ * @throws NoSuchMethodError if no suitable constructor is found.
+ * @throws IllegalStateException if all arguments are null.
  */
-inline fun <reified T : Any> Class<*>.createInstanceAsType(vararg args: Any?, isPublic: Boolean = true) =
-    createInstance(*args, isPublic = isPublic) as? T ?: error("$this's instance cannot be cast to type ${classOf<T>()}.")
+@JvmOverloads
+fun <T> Class<*>.createInstanceAsType(vararg args: Any?, isPublic: Boolean = true) =
+    createInstance(*args, isPublic = isPublic) as T
 
 /**
- * Create an instance of [KClass.java] with the given arguments and cast it to the specified type [T].
+ * Creates an instance of [KClass.java] with the given arguments and casts it to the specified type [T].
  * @see Class.createInstanceAsType
  */
-inline fun <reified T : Any> KClass<*>.createInstanceAsType(vararg args: Any?, isPublic: Boolean = true) =
+@JvmSynthetic
+fun <T> KClass<*>.createInstanceAsType(vararg args: Any?, isPublic: Boolean = true) =
     java.createInstanceAsType<T>(*args, isPublic = isPublic)
 
 /**
- * Create an instance of [Class] with the given arguments and cast it to the specified type [T] or return null if not found.
+ * Creates an instance of [Class] with the given arguments and casts it to the specified type [T] or returns null if failed.
  * @see Class.createInstance
  * @see Class.createInstanceOrNull
  * @see Class.createInstanceAsType
- * @return [T] or null if no suitable constructor is found or the instance cannot be cast to type [T].
+ * @return [T] or null if the instance cannot be created.
  */
-inline fun <reified T : Any> Class<*>.createInstanceAsTypeOrNull(vararg args: Any?, isPublic: Boolean = true) =
-    runCatching { createInstanceAsType<T>(*args, isPublic = isPublic) }.getOrNull()
+@JvmOverloads
+fun <T> Class<*>.createInstanceAsTypeOrNull(vararg args: Any?, isPublic: Boolean = true) =
+    createInstanceOrNull(*args, isPublic = isPublic) as T?
 
 /**
- * Create an instance of [KClass.java] with the given arguments and cast it to the specified type [T] or return null if not found.
+ * Creates an instance of [KClass.java] with the given arguments and casts it to the specified type [T] or returns null if failed.
  * @see Class.createInstanceAsTypeOrNull
  */
-inline fun <reified T : Any> KClass<*>.createInstanceAsTypeOrNull(vararg args: Any?, isPublic: Boolean = true) =
+@JvmSynthetic
+fun <T> KClass<*>.createInstanceAsTypeOrNull(vararg args: Any?, isPublic: Boolean = true) =
     java.createInstanceAsTypeOrNull<T>(*args, isPublic = isPublic)
 
 /**
- * Load the class with the given name using [ClassLoader] or return null if not found.
+ * Loads the class with the given name using [ClassLoader] or returns null if not found.
  * @receiver the [ClassLoader] to be used.
  * @param name the class name to be loaded.
  * @return [Class] or null.
  */
-fun ClassLoader.loadClassOrNull(name: String) = runCatching { loadClass(name) as? Class<Any>? }.getOrNull()
+fun ClassLoader.loadClassOrNull(name: String) = runCatching { loadClass(name) as Class<Any> }.getOrNull()
 
 /**
- * Check if the [ClassLoader] can load the class with the given name.
+ * Checks if the [ClassLoader] can load the class with the given name.
  * @receiver the [ClassLoader] to be checked.
  * @param name the class name to be checked.
  * @return [Boolean] true if the class can be loaded, false otherwise.
@@ -503,7 +614,7 @@ fun ClassLoader.loadClassOrNull(name: String) = runCatching { loadClass(name) as
 fun ClassLoader.hasClass(name: String) = loadClassOrNull(name) != null
 
 /**
- * Typecast [T] to [Class].
+ * Gets the [Class] of [T].
  * @param primitiveType whether to return the primitive type of [T] if it is a primitive type, default is true.
  * @return [Class]<[T]>
  */
@@ -511,7 +622,7 @@ inline fun <reified T : Any> classOf(primitiveType: Boolean = true) =
     if (primitiveType) T::class.javaPrimitiveType ?: T::class.java else T::class.javaObjectType
 
 /**
- * Use [Class.isAssignableFrom] to check if [Class] is a subclass of [superclass].
+ * Uses [Class.isAssignableFrom] to check if [Class] is a subclass of [superclass].
  * @see Class.isNotSubclassOf
  * @receiver the class to be checked.
  * @param superclass the superclass to be checked.
@@ -520,28 +631,28 @@ inline fun <reified T : Any> classOf(primitiveType: Boolean = true) =
 infix fun <T : Any> Class<T>.isSubclassOf(superclass: Class<*>) = superclass.isAssignableFrom(this)
 
 /**
- * Use [Class.isAssignableFrom] to check if [KClass.java] is a subclass of [superclass] ([KClass.java]).
+ * Uses [Class.isAssignableFrom] to check if [KClass.java] is a subclass of [superclass] ([KClass.java]).
  * @see Class.isSubclassOf
  */
 @JvmSynthetic
 infix fun <T : Any> KClass<T>.isSubclassOf(superclass: KClass<*>) = java isSubclassOf superclass.java
 
 /**
- * Use [Class.isAssignableFrom] to check if [KClass.java] is a subclass of [superclass].
+ * Uses [Class.isAssignableFrom] to check if [KClass.java] is a subclass of [superclass].
  * @see Class.isSubclassOf
  */
 @JvmSynthetic
 infix fun <T : Any> KClass<T>.isSubclassOf(superclass: Class<*>) = java isSubclassOf superclass
 
 /**
- * Use [Class.isAssignableFrom] to check if [Class] is a subclass of [superclass] ([KClass.java]).
+ * Uses [Class.isAssignableFrom] to check if [Class] is a subclass of [superclass] ([KClass.java]).
  * @see Class.isSubclassOf
  */
 @JvmSynthetic
 infix fun <T : Any> Class<T>.isSubclassOf(superclass: KClass<*>) = this isSubclassOf superclass.java
 
 /**
- * Use [Class.isAssignableFrom] to check if [Class] is not a subclass of [superclass].
+ * Uses [Class.isAssignableFrom] to check if [Class] is not a subclass of [superclass].
  * @see Class.isSubclassOf
  * @receiver the class to be checked.
  * @param superclass the superclass to be checked.
@@ -550,37 +661,37 @@ infix fun <T : Any> Class<T>.isSubclassOf(superclass: KClass<*>) = this isSubcla
 infix fun <T : Any> Class<T>.isNotSubclassOf(superclass: Class<*>) = !isSubclassOf(superclass)
 
 /**
- * Use [Class.isAssignableFrom] to check if [KClass.java] is not a subclass of [superclass] ([KClass.java]).
+ * Uses [Class.isAssignableFrom] to check if [KClass.java] is not a subclass of [superclass] ([KClass.java]).
  * @see Class.isNotSubclassOf
  */
 @JvmSynthetic
 infix fun <T : Any> KClass<T>.isNotSubclassOf(superclass: KClass<*>) = java isNotSubclassOf superclass.java
 
 /**
- * Use [Class.isAssignableFrom] to check if [KClass.java] is not a subclass of [superclass].
+ * Uses [Class.isAssignableFrom] to check if [KClass.java] is not a subclass of [superclass].
  * @see Class.isNotSubclassOf
  */
 @JvmSynthetic
 infix fun <T : Any> KClass<T>.isNotSubclassOf(superclass: Class<*>) = java isNotSubclassOf superclass
 
 /**
- * Use [Class.isAssignableFrom] to check if [Class] is not a subclass of [superclass] ([KClass.java]).
+ * Uses [Class.isAssignableFrom] to check if [Class] is not a subclass of [superclass] ([KClass.java]).
  * @see Class.isNotSubclassOf
  */
 @JvmSynthetic
 infix fun <T : Any> Class<T>.isNotSubclassOf(superclass: KClass<*>) = this isNotSubclassOf superclass.java
 
 /**
- * Whether the current [Class] has inheritance relationship,
- * and the superclass is [Any] will be considered to have no inheritance relationship.
+ * Whether the current [Class] has a superclass,
+ * [Any] is not considered as a superclass.
  * @receiver the [Class] to be checked.
  * @return [Boolean]
  */
 val <T : Any> Class<T>.hasSuperclass get() = superclass != null && superclass != classOf<Any>()
 
 /**
- * Whether the current [KClass.java] has inheritance relationship,
- * and the superclass is [Any] will be considered to have no inheritance relationship.
+ * Whether the current [KClass.java] has a superclass,
+ * [Any] is not considered as a superclass.
  * @see Class.hasSuperclass
  */
 @get:JvmSynthetic
@@ -600,10 +711,10 @@ val <T : Any> Class<T>.hasInterfaces get() = interfaces.isNotEmpty()
 @get:JvmSynthetic
 val <T : Any> KClass<T>.hasInterfaces get() = java.hasInterfaces
 
-// Class extension properties for checking modifiers.
+// region Class extension properties for checking modifiers
 
 /**
- * Check if the [Class] is public.
+ * Checks if the [Class] is public.
  * @see Modifier.isPublic
  * @receiver the [Class] to be checked.
  * @return `true` if the [Class] is public, `false` otherwise.
@@ -611,7 +722,7 @@ val <T : Any> KClass<T>.hasInterfaces get() = java.hasInterfaces
 val <T : Any> Class<T>.isPublic get() = Modifier.isPublic(modifiers)
 
 /**
- * Check if the [Class] is private.
+ * Checks if the [Class] is private.
  * @see Modifier.isPrivate
  * @receiver the [Class] to be checked.
  * @return `true` if the [Class] is private, `false` otherwise.
@@ -619,7 +730,7 @@ val <T : Any> Class<T>.isPublic get() = Modifier.isPublic(modifiers)
 val <T : Any> Class<T>.isPrivate get() = Modifier.isPrivate(modifiers)
 
 /**
- * Check if the [Class] is protected.
+ * Checks if the [Class] is protected.
  * @see Modifier.isProtected
  * @receiver the [Class] to be checked.
  * @return `true` if the [Class] is protected, `false` otherwise.
@@ -627,7 +738,7 @@ val <T : Any> Class<T>.isPrivate get() = Modifier.isPrivate(modifiers)
 val <T : Any> Class<T>.isProtected get() = Modifier.isProtected(modifiers)
 
 /**
- * Check if the [Class] is static.
+ * Checks if the [Class] is static.
  * @see Modifier.isStatic
  * @receiver the [Class] to be checked.
  * @return `true` if the [Class] is static, `false` otherwise.
@@ -635,7 +746,7 @@ val <T : Any> Class<T>.isProtected get() = Modifier.isProtected(modifiers)
 val <T : Any> Class<T>.isStatic get() = Modifier.isStatic(modifiers)
 
 /**
- * Check if the [Class] is final.
+ * Checks if the [Class] is final.
  * @see Modifier.isFinal
  * @receiver the [Class] to be checked.
  * @return `true` if the [Class] is final, `false` otherwise.
@@ -643,7 +754,7 @@ val <T : Any> Class<T>.isStatic get() = Modifier.isStatic(modifiers)
 val <T : Any> Class<T>.isFinal get() = Modifier.isFinal(modifiers)
 
 /**
- * Check if the [Class] is synchronized.
+ * Checks if the [Class] is synchronized.
  * @see Modifier.isSynchronized
  * @receiver the [Class] to be checked.
  * @return `true` if the [Class] is synchronized, `false` otherwise.
@@ -651,7 +762,7 @@ val <T : Any> Class<T>.isFinal get() = Modifier.isFinal(modifiers)
 val <T : Any> Class<T>.isSynchronized get() = Modifier.isSynchronized(modifiers)
 
 /**
- * Check if the [Class] is volatile.
+ * Checks if the [Class] is volatile.
  * @see Modifier.isVolatile
  * @receiver the [Class] to be checked.
  * @return `true` if the [Class] is volatile, `false` otherwise.
@@ -659,7 +770,7 @@ val <T : Any> Class<T>.isSynchronized get() = Modifier.isSynchronized(modifiers)
 val <T : Any> Class<T>.isVolatile get() = Modifier.isVolatile(modifiers)
 
 /**
- * Check if the [Class] is transient.
+ * Checks if the [Class] is transient.
  * @see Modifier.isTransient
  * @receiver the [Class] to be checked.
  * @return `true` if the [Class] is transient, `false` otherwise.
@@ -667,7 +778,7 @@ val <T : Any> Class<T>.isVolatile get() = Modifier.isVolatile(modifiers)
 val <T : Any> Class<T>.isTransient get() = Modifier.isTransient(modifiers)
 
 /**
- * Check if the [Class] is native.
+ * Checks if the [Class] is native.
  * @see Modifier.isNative
  * @receiver the [Class] to be checked.
  * @return `true` if the [Class] is native, `false` otherwise.
@@ -675,7 +786,7 @@ val <T : Any> Class<T>.isTransient get() = Modifier.isTransient(modifiers)
 val <T : Any> Class<T>.isNative get() = Modifier.isNative(modifiers)
 
 /**
- * Check if the [Class] is abstract.
+ * Checks if the [Class] is abstract.
  * @see Modifier.isAbstract
  * @receiver the [Class] to be checked.
  * @return `true` if the [Class] is abstract, `false` otherwise.
@@ -683,9 +794,11 @@ val <T : Any> Class<T>.isNative get() = Modifier.isNative(modifiers)
 val <T : Any> Class<T>.isAbstract get() = Modifier.isAbstract(modifiers)
 
 /**
- * Check if the [Class] is strict.
+ * Checks if the [Class] is strict.
  * @see Modifier.isStrict
  * @receiver the [Class] to be checked.
  * @return `true` if the [Class] is strict, `false` otherwise.
  */
 val <T : Any> Class<T>.isStrict get() = Modifier.isStrict(modifiers)
+
+// endregion

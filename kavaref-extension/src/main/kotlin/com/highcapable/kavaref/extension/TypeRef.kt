@@ -31,46 +31,55 @@ import java.lang.reflect.Type
 /**
  * Type reference class for getting generic parameter [T] type.
  *
- * The purpose of this class is to retain erased generics at runtime.
+ * Captures the Java type from a direct subclass's generic signature.
+ *
+ * Non-reified type variables remain unresolved, erased type arguments cannot be recovered.
+ * Nullable types are supported, but Kotlin nullability is not retained in [Type].
  * @see typeRef
  */
 @Keep
-abstract class TypeRef<T : Any> {
+abstract class TypeRef<T> {
 
     /**
-     * Get the generic parameter [T] type.
+     * Gets the generic parameter [T] type.
+     *
+     * Unresolved type variables are returned as-is.
      * @return [Type]
+     * @throws IllegalStateException if this is not a direct subclass with a type argument.
      */
     val type by lazy {
         when (val superclass = javaClass.genericSuperclass) {
             is ParameterizedType ->
                 if (superclass.rawType == classOf<TypeRef<*>>()) 
                     superclass.actualTypeArguments.firstOrNull() ?: error("Type argument cannot be null.")
-                else error("Must only create direct subclasses of TypeRef.")
-            classOf<TypeRef<*>>() -> error("TypeRef must be created with a type argument: object : TypeRef<...>() {}.")
-            else -> error("Must only create direct subclasses of TypeRef.")
+                else error("Only direct subclasses of TypeRef are allowed.")
+            classOf<TypeRef<*>>() -> error("TypeRef must be created with a type argument: object : TypeRef<...>() {}")
+            else -> error("Only direct subclasses of TypeRef are allowed.")
         }
     }
 
     /**
-     * Get the raw class type of the generic parameter [T].
-     * @return [Class]<[T]>
+     * Gets the raw class type of the generic parameter [T], preserving array dimensions.
+     * @return [Class] with erased type arguments.
+     * @throws TypeCastException if the type or its array component has no concrete raw class.
      */
-    val rawType by lazy { type.toClass<T>() }
+    val rawType: Class<*> by lazy { type.toClass() }
 
-    override fun toString() = type.toString()
+    override fun toString() = runCatching { type.toString() }.getOrElse { "${javaClass.name} (invalid)" }
     override fun equals(other: Any?) = other is TypeRef<*> && type == other.type
     override fun hashCode() = type.hashCode()
 }
 
 /**
- * Create a [TypeRef] instance with the reified type parameter [T].
+ * Creates a [TypeRef] instance with the reified type parameter [T].
+ *
+ * Nullable types are supported, but Kotlin nullability is not retained in the captured Java type.
  *
  * Usage:
  *
  * ```kotlin
  * val typeRef = typeRef<List<String>>()
- * // This will be of type `List<String>`.
+ * // This will be of type `List<? extends String>`.
  * val type = typeRef.type
  * // This will be of type `List`.
  * val rawType = typeRef.rawType
@@ -78,4 +87,4 @@ abstract class TypeRef<T : Any> {
  * @see TypeRef
  * @return [TypeRef]<[T]>
  */
-inline fun <reified T : Any> typeRef() = object : TypeRef<T>() {}
+inline fun <reified T> typeRef() = object : TypeRef<T>() {}

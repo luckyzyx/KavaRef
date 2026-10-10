@@ -10,6 +10,5 @@ dependencies {
     implementation(projects.kavarefJvm)
     implementation(projects.kavarefExtension)
 
-    // SLF4J Simple Logger
-    implementation(libs.slf4j.simple)
+    testImplementation(libs.junit)
 }

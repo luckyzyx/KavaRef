@@ -74,6 +74,14 @@ ClassLoaderProvider.classLoader = MyCustomClassLoader()
 
 你也可以手动向 `toClass` 方法传入一个 `ClassLoader` 参数来指定使用哪个 `ClassLoader`。
 
+如果没有传入 `ClassLoader` 且未设置 `ClassLoaderProvider.classLoader`，将会使用装载 KavaRef 的 `ClassLoader`。
+
+::: tip
+
+`toClass` 方法默认不会初始化 `Class` (不会执行其中的静态代码块)，如果你需要初始化，请设置 `initialize = true`。
+
+:::
+
 #### Class 对象引用
 
 在 Kotlin 中引用 Java Class 需要写很长的声明，例如 `MyClass::class.java`，此时你可以用以下方式来简化。
@@ -121,9 +129,21 @@ val mySuperClass = MyClass::class.createInstanceAsType<MySuperClass>("Hello", 12
 val mySuperClassOrNull = MyClass::class.createInstanceAsTypeOrNull<MySuperClass>("Hello", 123)
 ```
 
+如果有多个构造方法都可以接受传入的参数，KavaRef 会参考 Java 的重载规则，优先选择无需拆箱即可匹配的构造方法，然后选择其中参数类型最具体的一个。
+
+> 示例如下
+
+```kotlin
+// 假设 MyClass 同时存在 MyClass(Object) 与 MyClass(String) 两个构造方法
+// 这里将会使用 MyClass(String)
+val myClass = MyClass::class.createInstance("Hello")
+```
+
 ::: tip
 
 `createInstance` 方法在成功匹配一次后，会将结果进行缓存防止重复反射造成的性能损耗，它是线程安全的，你可以放心在任何标准场景下使用。
+
+缓存不会阻止 `Class` 及其 `ClassLoader` 被回收，在插件化等需要动态装载和卸载 `ClassLoader` 的场景下也可以放心使用。
 
 :::
 
@@ -132,6 +152,8 @@ val mySuperClassOrNull = MyClass::class.createInstanceAsTypeOrNull<MySuperClass>
 当你传入带有 `null` 的参数时，KavaRef 会尝试将其作为可匹配到条件的一部分 (模糊条件)，准确性可能会下降。
 
 `createInstance` 方法不允许所有参数均为 `null` 的情况 (条件完全模糊)，会直接抛出异常，因为这种情况无法确定要创建哪个实例。
+
+如果无法确定唯一一个参数类型最具体的构造方法 (例如传入的 `null` 使多个构造方法无法区分)，也会直接抛出异常，而不是随意选择其中一个。
 
 :::
 
@@ -154,6 +176,8 @@ val myClass = VariousClass("com.example.a", "com.example.b").load()
 // 你也可以使用后缀名为 OrNull 的方法在找不到 Class 时返回 null 而不是抛出异常
 val myClassOrNull = VariousClass("com.example.a", "com.example.b").loadOrNull()
 ```
+
+`VariousClass` 装载 `Class` 时使用的 `ClassLoader` 与 `toClass` 方法相同。
 
 #### 延迟装载 Class 对象
 
@@ -249,6 +273,19 @@ val clazz = type.toClass()
 val clazzOrNull = type.toClassOrNull()
 ```
 
+`toClass` 同样支持泛型数组 (`GenericArrayType`)，转换时会保留数组的维度。
+
+> 示例如下
+
+```kotlin
+// 假设这是 List<String>[] 的 Type
+val genericArrayType: GenericArrayType
+// 将会得到 java.util.List[]
+val arrayClass = genericArrayType.toClass()
+```
+
+类型变量 (`TypeVariable`) 和通配符类型 (`WildcardType`) 没有确定的 `Class`，转换时将会抛出异常。
+
 你也可以将符合要求的 `Type` 转换为 `ParameterizedType` 对象。
 
 > 示例如下
@@ -272,9 +309,9 @@ val arguments = myClass.genericSuperclassTypeArguments()
 
 ### 类型引用扩展
 
-在 Java 中，方法的泛型会在编译后被类型擦除，在运行获取到的类型是 `java.lang.Object`。
+在 Java 中，泛型在编译后会被擦除，运行时无法直接从一个对象上得知它的泛型参数。
 
-KavaRef 提供了 `TypeRef` 类来包装你的目标泛型来确保你可以在运行时获取到正确的泛型类型，它的核心功能参考于 [Gson](https://github.com/google/gson) 的 `TypeToken`。
+KavaRef 提供了 `TypeRef` 类，它通过匿名子类的泛型签名来保留完整的类型信息，核心功能参考于 [Gson](https://github.com/google/gson) 的 `TypeToken`。
 
 它的使用方法非常简单，你可以像下面这样使用它。
 
@@ -288,6 +325,17 @@ val type = listStringType.type
 val rawType = listStringType.rawType
 ```
 
+`rawType` 同样支持泛型数组，并会保留数组的维度。
+
+> 示例如下
+
+```kotlin
+// 将会是 java.util.List[]
+val arrayRawType = typeRef<Array<List<String>>>().rawType
+// 多维数组同样适用，将会是 java.util.List[][]
+val nestedArrayRawType = typeRef<Array<Array<List<String>>>>().rawType
+```
+
 在使用 Gson 等需要传入 `Type` 的场景中，你可以为此实现一个带有 `reified` 泛型的扩展方法。
 
 > 示例如下
@@ -295,11 +343,43 @@ val rawType = listStringType.rawType
 ```kotlin
 val gson = Gson()
 
-inline fun <reified T : Any> T.toJson(): String = gson.toJson(this, typeRef<T>().type)
+inline fun <reified T> T.toJson(): String = gson.toJson(this, typeRef<T>().type)
 
 // 使用方法
 val json = listOf("KavaRef", "is", "awesome").toJson()
 ```
+
+::: warning
+
+`TypeRef` 得到的是 Java 的 `Type`，它不包含 Kotlin 的可空性，所以 `typeRef<String?>()` 与 `typeRef<String>()` 是相等的，`List<String?>?` 也同理。
+
+如果你需要区分可空性，请使用 Kotlin 的 `typeOf<T>()` 获取 `KType`。
+
+:::
+
+::: danger
+
+`TypeRef` 只能被直接继承，例如 `object : TypeRef<List<String>>() {}`，继承一个 `TypeRef` 的子类后，获取 `type` 或 `rawType` 时将会抛出异常。
+
+:::
+
+在没有 `reified` 的泛型方法中创建 `TypeRef` 时，泛型参数不会被替换为调用时传入的类型。
+
+> 示例如下
+
+```kotlin
+fun <T> createTypeRef() = object : TypeRef<T>() {}
+
+val typeRef = createTypeRef<String>()
+// 得到的是类型变量 T，而不是 String
+val type = typeRef.type
+// T 没有确定的 Class，这里将会抛出异常
+val rawType = typeRef.rawType
+```
+
+`List<T>` 这类本身有原始类的类型不受影响，`rawType` 仍然是 `List`，但 `T` 和 `Array<T>` 的 `rawType` 都无法获取。
+
+所以，请尽量在带有 `reified` 泛型的方法中使用 `typeRef<T>()`。
 
 ### Java 包装类扩展
 

@@ -24,69 +24,75 @@
 
 package com.highcapable.kavaref.extension
 
+import java.lang.reflect.GenericArrayType
 import java.lang.reflect.ParameterizedType
 import java.lang.reflect.Type
 import kotlin.reflect.KClass
 
 /**
- * Convert [Type] to [Class].
+ * Converts [Type] to [Class].
+ *
+ * Generic arrays use the raw class of their component type, preserving array dimensions.
+ * Type variables and wildcard types cannot be converted.
  * @see Type.toClassOrNull
  * @receiver the [Type] to be converted.
+ * @return [Class]
+ * @throws TypeCastException if the conversion fails.
+ */
+fun Type.toClass(): Class<Any> = when (this) {
+    is Class<*> -> this as Class<Any>
+    is ParameterizedType -> rawType.toClass()
+    is GenericArrayType -> ArrayClass(genericComponentType.toClass()) as Class<Any>
+    else -> throw TypeCastException("Cannot cast type $this to a java.lang.Class object.")
+}
+
+/**
+ * Converts [Type] to [Class], then casts it to [Class]<[T]>.
+ * @see Type.toClass
+ * @see Type.toClassOrNull
  * @return [Class]<[T]>
  * @throws TypeCastException if the conversion fails.
  */
 @JvmName("toClassTyped")
-tailrec fun <T : Any> Type.toClass(): Class<T> = when (this) {
-    is Class<*> -> this as Class<T>
-    is ParameterizedType -> rawType.toClass<T>()
-    else -> throw TypeCastException("Cannot cast type $this to java.lang.Class object.")
-}
+fun <T : Any> Type.toClass() = toClass() as Class<T>
 
 /**
- * Convert [Type] to [Class].
- * @see Type.toClass
- * @see Type.toClassOrNull
- * @return [Class]
- */
-fun Type.toClass() = toClass<Any>()
-
-/**
- * Safely convert [Type] to [Class] or return null if it fails.
+ * Safely converts [Type] to [Class] or returns null if it fails.
  * @see Type.toClass
  * @receiver the [Type] to be converted.
- * @return [Class]<[T]> or null.
- */
-@JvmName("toClassTypedOrNull")
-fun <T : Any> Type.toClassOrNull() = runCatching { toClass<T>() }.getOrNull()
-
-/**
- * Safely convert [Type] to [Class] or return null if it fails.
- * @see Type.toClass
- * @see Type.toClassOrNull
  * @return [Class] or null.
  */
-fun Type.toClassOrNull() = toClassOrNull<Any>()
+fun Type.toClassOrNull() = runCatching { toClass() }.getOrNull()
 
 /**
- * Convert [Type] to [ParameterizedType].
+ * Safely converts [Type] to [Class] and casts it to [Class]<[T]>, or returns null if it fails.
+ * @see Type.toClass
+ * @see Type.toClassOrNull
+ * @return [Class]<[T]> or null if the conversion fails.
+ */
+@JvmName("toClassTypedOrNull")
+fun <T : Any> Type.toClassOrNull() = toClassOrNull() as Class<T>?
+
+/**
+ * Converts [Type] to [ParameterizedType].
  * @see Type.asParameterizedTypeOrNull
- * @receiver the [Class] to get the [ParameterizedType].
+ * @receiver the [Type] to be converted.
  * @return [ParameterizedType]
  */
 inline fun <reified T : Type> T.asParameterizedType() = this as ParameterizedType
 
 /**
- * Safely convert [Type] to [ParameterizedType] or return null if it fails.
+ * Safely converts [Type] to [ParameterizedType] or returns null if it fails.
  * @see Type.asParameterizedType
- * @receiver the [Class] to get the [ParameterizedType].
+ * @receiver the [Type] to be converted.
  * @return [ParameterizedType] or null.
  */
 inline fun <reified T : Type> T.asParameterizedTypeOrNull() = this as? ParameterizedType?
 
 /**
- * Get the type arguments of the superclass of this [Class] or return an empty array if it fails.
+ * Gets the type arguments of the superclass of this [Class] or returns an empty array if it fails.
  *
- * This function will implement the following functions:
+ * This function is equivalent to the following code:
  *
  * ```kotlin
  * (Class.genericSuperclass as ParameterizedType).actualTypeArguments
@@ -99,7 +105,7 @@ fun <T : Any> Class<T>.genericSuperclassTypeArguments(): Array<Type> = runCatchi
 }.getOrDefault(emptyArray())
 
 /**
- * Get the type arguments of the superclass of this [KClass.java] or return an empty array if it fails.
+ * Gets the type arguments of the superclass of this [KClass.java] or returns an empty array if it fails.
  * @see Class.genericSuperclassTypeArguments
  */
 @JvmSynthetic

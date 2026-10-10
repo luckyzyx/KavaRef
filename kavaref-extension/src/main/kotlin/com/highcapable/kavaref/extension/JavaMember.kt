@@ -25,7 +25,10 @@
 package com.highcapable.kavaref.extension
 
 import java.lang.reflect.AccessibleObject
+import java.lang.reflect.Constructor
+import java.lang.reflect.Field
 import java.lang.reflect.Member
+import java.lang.reflect.Method
 import java.lang.reflect.Modifier
 
 /**
@@ -36,17 +39,19 @@ import java.lang.reflect.Modifier
 private var isTrySetAccessibleSupported = true
 
 /**
- * Make [AccessibleObject] implements [Member] accessible.
+ * Makes the [Member] that extends [AccessibleObject] accessible.
+ *
+ * If it is already accessible, it returns directly without checking again.
  * @receiver the [Member] to be made accessible.
  * @return [Boolean]
  */
 fun Member.makeAccessible() = (this as? AccessibleObject?)?.let {
-    fun doAccessible() = runCatching {
-        @Suppress("DEPRECATION")
-        if (!it.isAccessible) it.isAccessible = true
+    // Avoid calling trySetAccessible every time, it checks the caller on each call.
+    @Suppress("DEPRECATION")
+    if (it.isAccessible) return@let true
 
-        true
-    }.getOrDefault(false)
+    @Suppress("DEPRECATION")
+    fun doAccessible() = runCatching { it.isAccessible = true }.isSuccess
 
     if (!isTrySetAccessibleSupported) return@let doAccessible()
 
@@ -58,100 +63,116 @@ fun Member.makeAccessible() = (this as? AccessibleObject?)?.let {
     }
 } == true
 
-// Member extension properties for checking modifiers.
+// region Member extension properties for checking modifiers
 
 /**
- * Check if the [Member] is public.
+ * Checks if the [Member] is public.
  * @see Modifier.isPublic
  * @receiver the [Member] to be checked.
  * @return `true` if the [Member] is public, `false` otherwise.
  */
-val Member.isPublic get() = Modifier.isPublic(modifiers)
+val Member.isPublic get() = Modifier.isPublic(sourceModifiers)
 
 /**
- * Check if the [Member] is private.
+ * Checks if the [Member] is private.
  * @see Modifier.isPrivate
  * @receiver the [Member] to be checked.
  * @return `true` if the [Member] is private, `false` otherwise.
  */
-val Member.isPrivate get() = Modifier.isPrivate(modifiers)
+val Member.isPrivate get() = Modifier.isPrivate(sourceModifiers)
 
 /**
- * Check if the [Member] is protected.
+ * Checks if the [Member] is protected.
  * @see Modifier.isProtected
  * @receiver the [Member] to be checked.
  * @return `true` if the [Member] is protected, `false` otherwise.
  */
-val Member.isProtected get() = Modifier.isProtected(modifiers)
+val Member.isProtected get() = Modifier.isProtected(sourceModifiers)
 
 /**
- * Check if the [Member] is static.
+ * Checks if the [Member] is static.
  * @see Modifier.isStatic
  * @receiver the [Member] to be checked.
  * @return `true` if the [Member] is static, `false` otherwise.
  */
-val Member.isStatic get() = Modifier.isStatic(modifiers)
+val Member.isStatic get() = Modifier.isStatic(sourceModifiers)
 
 /**
- * Check if the [Member] is final.
+ * Checks if the [Member] is final.
  * @see Modifier.isFinal
  * @receiver the [Member] to be checked.
  * @return `true` if the [Member] is final, `false` otherwise.
  */
-val Member.isFinal get() = Modifier.isFinal(modifiers)
+val Member.isFinal get() = Modifier.isFinal(sourceModifiers)
 
 /**
- * Check if the [Member] is synchronized.
+ * Checks if the [Member] is synchronized.
  * @see Modifier.isSynchronized
  * @receiver the [Member] to be checked.
  * @return `true` if the [Member] is synchronized, `false` otherwise.
  */
-val Member.isSynchronized get() = Modifier.isSynchronized(modifiers)
+val Member.isSynchronized get() = Modifier.isSynchronized(sourceModifiers)
 
 /**
- * Check if the [Member] is volatile.
+ * Checks if the [Member] is volatile.
  * @see Modifier.isVolatile
  * @receiver the [Member] to be checked.
  * @return `true` if the [Member] is volatile, `false` otherwise.
  */
-val Member.isVolatile get() = Modifier.isVolatile(modifiers)
+val Member.isVolatile get() = Modifier.isVolatile(sourceModifiers)
 
 /**
- * Check if the [Member] is transient.
+ * Checks if the [Member] is transient.
  * @see Modifier.isTransient
  * @receiver the [Member] to be checked.
  * @return `true` if the [Member] is transient, `false` otherwise.
  */
-val Member.isTransient get() = Modifier.isTransient(modifiers)
+val Member.isTransient get() = Modifier.isTransient(sourceModifiers)
 
 /**
- * Check if the [Member] is native.
+ * Checks if the [Member] is native.
  * @see Modifier.isNative
  * @receiver the [Member] to be checked.
  * @return `true` if the [Member] is native, `false` otherwise.
  */
-val Member.isNative get() = Modifier.isNative(modifiers)
+val Member.isNative get() = Modifier.isNative(sourceModifiers)
 
 /**
- * Check if the [Member] is an interface.
+ * Checks if the [Member] is an interface.
  * @see Modifier.isInterface
  * @receiver the [Member] to be checked.
  * @return `true` if the [Member] is an interface, `false` otherwise.
  */
-val Member.isInterface get() = Modifier.isInterface(modifiers)
+val Member.isInterface get() = Modifier.isInterface(sourceModifiers)
 
 /**
- * Check if the [Member] is abstract.
+ * Checks if the [Member] is abstract.
  * @see Modifier.isAbstract
  * @receiver the [Member] to be checked.
  * @return `true` if the [Member] is abstract, `false` otherwise.
  */
-val Member.isAbstract get() = Modifier.isAbstract(modifiers)
+val Member.isAbstract get() = Modifier.isAbstract(sourceModifiers)
 
 /**
- * Check if the [Member] is strict.
+ * Checks if the [Member] is strict.
  * @see Modifier.isStrict
  * @receiver the [Member] to be checked.
  * @return `true` if the [Member] is strict, `false` otherwise.
  */
-val Member.isStrict get() = Modifier.isStrict(modifiers)
+val Member.isStrict get() = Modifier.isStrict(sourceModifiers)
+
+// endregion
+
+/**
+ * Gets the source-level modifiers of [Member].
+ *
+ * The JVM reuses some modifier bits for bridge and varargs methods,
+ * so they are masked out by the member type to avoid false matches.
+ * @return [Int]
+ */
+private val Member.sourceModifiers get() = modifiers and when (this) {
+    is Method -> Modifier.methodModifiers()
+    is Constructor<*> -> Modifier.constructorModifiers()
+    is Field -> Modifier.fieldModifiers()
+    else -> modifiers
+}

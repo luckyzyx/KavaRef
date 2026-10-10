@@ -33,7 +33,7 @@ import java.lang.reflect.Member
  * 
  * [T] to specify the declaring class type of the executable.
  */
-abstract class ExecutableCondition<E : Member, R : MemberResolver<E, T>, T : Any> : MemberCondition<E, R, T>() {
+abstract class ExecutableCondition<E : Member, R : MemberResolver<E, T, *>, T : Any> : MemberCondition<E, R, T>() {
 
     /** @see Executable.getParameterTypes */
     val parameters = mutableListOf<Any>()
@@ -57,22 +57,22 @@ abstract class ExecutableCondition<E : Member, R : MemberResolver<E, T>, T : Any
     var parameterCountCondition: ((Int) -> Boolean)? = null
 
     /** @see Executable.getExceptionTypes */
-    val exceptionTypes = mutableSetOf<Any>()
+    val exceptionTypes = mutableListOf<Any>()
 
     /** @see Executable.getExceptionTypes */
-    val exceptionTypesNot = mutableSetOf<Any>()
+    val exceptionTypesNot = mutableListOf<Any>()
 
     /** @see Executable.getGenericExceptionTypes */
-    val genericExceptionTypes = mutableSetOf<TypeMatcher>()
+    val genericExceptionTypes = mutableListOf<TypeMatcher>()
 
     /** @see Executable.getGenericExceptionTypes */
-    val genericExceptionTypesNot = mutableSetOf<TypeMatcher>()
+    val genericExceptionTypesNot = mutableListOf<TypeMatcher>()
 
     /** @see Executable.getGenericParameterTypes */
-    val genericParameters = mutableSetOf<TypeMatcher>()
+    val genericParameters = mutableListOf<TypeMatcher>()
 
     /** @see Executable.getGenericParameterTypes */
-    val genericParametersNot = mutableSetOf<TypeMatcher>()
+    val genericParametersNot = mutableListOf<TypeMatcher>()
 
     /** @see Executable.isVarArgs */
     var isVarArgs: Boolean? = null
@@ -99,16 +99,16 @@ abstract class ExecutableCondition<E : Member, R : MemberResolver<E, T>, T : Any
     val annotatedReceiverTypeNot = mutableSetOf<Any>()
 
     /** @see Executable.getAnnotatedParameterTypes */
-    val annotatedParameterTypes = mutableSetOf<Any>()
+    val annotatedParameterTypes = mutableListOf<Set<Any>>()
 
     /** @see Executable.getAnnotatedParameterTypes */
-    val annotatedParameterTypesNot = mutableSetOf<Any>()
+    val annotatedParameterTypesNot = mutableListOf<Set<Any>>()
 
     /** @see Executable.getAnnotatedExceptionTypes */
-    val annotatedExceptionTypes = mutableSetOf<Any>()
+    val annotatedExceptionTypes = mutableListOf<Set<Any>>()
 
     /** @see Executable.getAnnotatedExceptionTypes */
-    val annotatedExceptionTypesNot = mutableSetOf<Any>()
+    val annotatedExceptionTypesNot = mutableListOf<Set<Any>>()
 
     /** @see Executable.getParameterTypes */
     open fun parameters(vararg types: Any) = apply {
@@ -126,7 +126,7 @@ abstract class ExecutableCondition<E : Member, R : MemberResolver<E, T>, T : Any
     }
 
     /**
-     * Set [parameterCount] to `0` to match methods with no parameters.
+     * Sets [parameterCount] to `0` to match methods with no parameters.
      * @see Executable.getParameterCount
      */
     open fun emptyParameters() = apply {
@@ -134,7 +134,7 @@ abstract class ExecutableCondition<E : Member, R : MemberResolver<E, T>, T : Any
     }
 
     /**
-     * Set [parameterCountCondition] to check if the method has parameters.
+     * Sets [parameterCountCondition] to check if the method has parameters.
      * @see Executable.getParameterCount
      */
     open fun emptyParametersNot() = apply {
@@ -149,6 +149,16 @@ abstract class ExecutableCondition<E : Member, R : MemberResolver<E, T>, T : Any
     /** @see Executable.getTypeParameters */
     open fun typeParametersNot(vararg types: TypeMatcher) = apply {
         this.typeParametersNot.addAll(types)
+    }
+
+    /** @see Executable.getTypeParameters */
+    open fun emptyTypeParameters() = apply {
+        emptyConditions += EMPTY_TYPE_PARAMETERS
+    }
+
+    /** @see Executable.getTypeParameters */
+    open fun emptyTypeParametersNot() = apply {
+        emptyConditions += EMPTY_TYPE_PARAMETERS_NOT
     }
 
     /** @see Executable.getParameterCount */
@@ -171,6 +181,16 @@ abstract class ExecutableCondition<E : Member, R : MemberResolver<E, T>, T : Any
         this.exceptionTypesNot.addAll(types)
     }
 
+    /** @see Executable.getExceptionTypes */
+    open fun emptyExceptionTypes() = apply {
+        emptyConditions += EMPTY_EXCEPTION_TYPES
+    }
+
+    /** @see Executable.getExceptionTypes */
+    open fun emptyExceptionTypesNot() = apply {
+        emptyConditions += EMPTY_EXCEPTION_TYPES_NOT
+    }
+
     /** @see Executable.getGenericExceptionTypes */
     open fun genericExceptionTypes(vararg types: TypeMatcher) = apply {
         this.genericExceptionTypes.addAll(types)
@@ -179,6 +199,16 @@ abstract class ExecutableCondition<E : Member, R : MemberResolver<E, T>, T : Any
     /** @see Executable.getGenericExceptionTypes */
     open fun genericExceptionTypesNot(vararg types: TypeMatcher) = apply {
         this.genericExceptionTypesNot.addAll(types)
+    }
+
+    /** @see Executable.getGenericExceptionTypes */
+    open fun emptyGenericExceptionTypes() = apply {
+        emptyConditions += EMPTY_GENERIC_EXCEPTION_TYPES
+    }
+
+    /** @see Executable.getGenericExceptionTypes */
+    open fun emptyGenericExceptionTypesNot() = apply {
+        emptyConditions += EMPTY_GENERIC_EXCEPTION_TYPES_NOT
     }
 
     /** @see Executable.getGenericParameterTypes */
@@ -232,23 +262,23 @@ abstract class ExecutableCondition<E : Member, R : MemberResolver<E, T>, T : Any
     }
 
     /** @see Executable.getAnnotatedParameterTypes */
-    open fun annotatedParameterTypes(vararg types: Any) = apply {
-        this.annotatedParameterTypes.addAll(types.toList())
+    open fun annotatedParameterTypes(vararg types: Set<Any>) = apply {
+        this.annotatedParameterTypes.addAll(types)
     }
 
     /** @see Executable.getAnnotatedParameterTypes */
-    open fun annotatedParameterTypesNot(vararg types: Any) = apply {
-        this.annotatedParameterTypesNot.addAll(types.toList())
+    open fun annotatedParameterTypesNot(vararg types: Set<Any>) = apply {
+        this.annotatedParameterTypesNot.addAll(types)
     }
 
     /** @see Executable.getAnnotatedExceptionTypes */
-    open fun annotatedExceptionTypes(vararg types: Any) = apply {
-        this.annotatedExceptionTypes.addAll(types.toList())
+    open fun annotatedExceptionTypes(vararg types: Set<Any>) = apply {
+        this.annotatedExceptionTypes.addAll(types)
     }
 
     /** @see Executable.getAnnotatedExceptionTypes */
-    open fun annotatedExceptionTypesNot(vararg types: Any) = apply {
-        this.annotatedExceptionTypesNot.addAll(types.toList())
+    open fun annotatedExceptionTypesNot(vararg types: Set<Any>) = apply {
+        this.annotatedExceptionTypesNot.addAll(types)
     }
 
     override fun initializeCopiedData(newSelf: MemberCondition<E, R, T>) {
@@ -401,7 +431,13 @@ abstract class ExecutableCondition<E : Member, R : MemberResolver<E, T>, T : Any
             ANNOTATED_PARAMETER_TYPES to annotatedParameterTypes,
             ANNOTATED_PARAMETER_TYPES_NOT to annotatedParameterTypesNot,
             ANNOTATED_EXCEPTION_TYPES to annotatedExceptionTypes,
-            ANNOTATED_EXCEPTION_TYPES_NOT to annotatedExceptionTypesNot
+            ANNOTATED_EXCEPTION_TYPES_NOT to annotatedExceptionTypesNot,
+            EMPTY_TYPE_PARAMETERS to emptyConditionOf(EMPTY_TYPE_PARAMETERS),
+            EMPTY_TYPE_PARAMETERS_NOT to emptyConditionOf(EMPTY_TYPE_PARAMETERS_NOT),
+            EMPTY_EXCEPTION_TYPES to emptyConditionOf(EMPTY_EXCEPTION_TYPES),
+            EMPTY_EXCEPTION_TYPES_NOT to emptyConditionOf(EMPTY_EXCEPTION_TYPES_NOT),
+            EMPTY_GENERIC_EXCEPTION_TYPES to emptyConditionOf(EMPTY_GENERIC_EXCEPTION_TYPES),
+            EMPTY_GENERIC_EXCEPTION_TYPES_NOT to emptyConditionOf(EMPTY_GENERIC_EXCEPTION_TYPES_NOT)
         )
 
     companion object {
@@ -430,5 +466,11 @@ abstract class ExecutableCondition<E : Member, R : MemberResolver<E, T>, T : Any
         const val ANNOTATED_PARAMETER_TYPES_NOT = "annotatedParameterTypesNot"
         const val ANNOTATED_EXCEPTION_TYPES = "annotatedExceptionTypes"
         const val ANNOTATED_EXCEPTION_TYPES_NOT = "annotatedExceptionTypesNot"
+        const val EMPTY_TYPE_PARAMETERS = "emptyTypeParameters"
+        const val EMPTY_TYPE_PARAMETERS_NOT = "emptyTypeParametersNot"
+        const val EMPTY_EXCEPTION_TYPES = "emptyExceptionTypes"
+        const val EMPTY_EXCEPTION_TYPES_NOT = "emptyExceptionTypesNot"
+        const val EMPTY_GENERIC_EXCEPTION_TYPES = "emptyGenericExceptionTypes"
+        const val EMPTY_GENERIC_EXCEPTION_TYPES_NOT = "emptyGenericExceptionTypesNot"
     }
 }

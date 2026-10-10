@@ -45,7 +45,7 @@ Please change `<version>` to the version displayed at the top of this document.
 ::: danger
 
 Since `1.1.0`, in order to be compatible with the differences in binary files distributed for each platform,
-`KavaRef` introduced a new base module. When updating to this version,
+KavaRef introduced a new base module. When updating to this version,
 you must choose a platform-related base module as a dependency, otherwise it will cause a `NoClassDefFoundError` exception.
 
 For the Android platform, please choose [kavaref-android](kavaref-android.md), and for the JVM platform, please choose [kavaref-jvm](kavaref-jvm.md).
@@ -202,6 +202,16 @@ test.asResolver()
     .invoke("task_name")
 ```
 
+::: danger
+
+`asResolver()` always uses the caller as the instance, it cannot be used on `Class` or `KClass`,
+calling it directly on `Class` or `KClass` will cause a compilation error, please use `resolve()` to reflect the members of a class.
+
+If the type of the caller is declared as `Any` or other types but it is actually a `Class` or `KClass` object,
+it will also be used as the instance, and the members of `Class` or `KClass` itself will be reflected at this time.
+
+:::
+
 Next, we need to get the `isTaskRunning` variable, which can be written in the following form.
 
 > The following example
@@ -227,6 +237,7 @@ val test = Test::class.resolve()
         // For the zero parameter constructor,
         // the following condition can be used to filter.
         // It is equivalent to parameterCount = 0.
+        // Do not write it as parameters(), it adds no condition without parameter types.
         emptyParameters()
     }.create() // Create a new Test instance.
 ```
@@ -254,6 +265,8 @@ to set the current instance. If the reflection is a static member, you do not ne
 :::
 
 ::: warning
+
+Typed functions such as `get<T>()` and `invoke<T>()` do not check the actual type, a `ClassCastException` will be thrown when using the result if the type does not match.
 
 The `Any.resolve()` function has been deprecated in version `1.0.1` and removed in version `1.0.2`,
 because it pollutes the namespace (for example `File.resolve("/path/to/file")`), and now use `Any.asResolver()` instead.
@@ -339,6 +352,19 @@ Test::class.resolve()
     }.of(test).invoke("task_name")
 ```
 
+::: tip
+
+All conditions are filtered in a fixed order inside KavaRef instead of the order you write them,
+once a member is excluded by a condition, the subsequent conditions will no longer be evaluated for it.
+
+If a freedom condition throws an exception while filtering a member, the member will be treated as not matched,
+so you can write freedom conditions only for the members you care about.
+
+If no member is found in the end, these exceptions will be listed in the exception message of no member found,
+please refer to [Exception Handling](#exception-handling) for details.
+
+:::
+
 ### Generic Conditions
 
 KavaRef supports adding generic filtering conditions, which you can use the relevant functions provided by `TypeMatcher`.
@@ -355,7 +381,7 @@ box.asResolver()
     .firstMethod {
         name = "print"
         // Set generic parameter conditions.
-        genericParametes(
+        genericParameters(
             // Filter generic name "T".
             typeVar("T"),
             // Create TypeMatcher through Class.
@@ -390,7 +416,10 @@ At this time, we can get this method in the superclass.
 ::: tip
 
 `superclass()` once set it,it will automatically loop backwards whether there is this method in all inherited
-superclasses until the target has no superclass (the inheritance relationship is `java.lang.Object`).
+superclasses until `java.lang.Object` (including `java.lang.Object` itself).
+
+`superclass()` only takes effect on the current filter condition,
+other filter conditions created in the same `resolve()` will not be affected.
 
 :::
 
@@ -399,6 +428,38 @@ superclasses until the target has no superclass (the inheritance relationship is
 The current filtering method can only filter to the current `Class` method unless the `superclass()` condition is specified,
 which is the default behavior of the Java reflection API.
 KavaRef will call `Class.getDeclaredMethods()` to get the current `Class` method instead of `Class.getMethods()`.
+
+:::
+
+If you also need to filter the members in interfaces, such as default methods in interfaces, you can use `superclass(interfaces = true)`.
+
+> The following example
+
+```kotlin
+// Suppose this is an instance of this Class, it implements the interface that declares the doApiTask method.
+val test: Test
+// Call and execute with KavaRef.
+Test::class.resolve()
+    .firstMethod {
+        name = "doApiTask"
+        // Filter in superclasses and interfaces.
+        superclass(interfaces = true)
+    }.of(test).invoke()
+```
+
+::: tip
+
+`superclass(interfaces = true)` will filter all superclasses in the way of `superclass()` first, then filter all interfaces,
+a sub-interface is always filtered before its super-interfaces.
+
+Default methods, static methods and constants in interfaces can all be filtered.
+
+:::
+
+::: warning
+
+On Android, if the minSdk of the app is lower than 24, D8 will move the static methods in interfaces to its generated helper classes at compile time,
+and these static methods cannot be filtered in interfaces at this time.
 
 :::
 
@@ -442,6 +503,8 @@ Test::class.resolve()
     }.of(test).invoke("task_name")
 ```
 
+To filter an empty result, such as methods that declare no exceptions, use the functions starting with `empty` like `emptyExceptionTypes()`, `exceptionTypes()` without arguments adds no condition.
+
 ### Exception Handling
 
 By default, KavaRef throws an exception when a member is not found during a reflection call.
@@ -474,7 +537,7 @@ KavaRef prints the complete exception content for debugging, and when using `opt
 > The following example
 
 ``` :no-line-numbers
-No method found matching the condition for current class.
+No method found matching the condition for the current class.
 +------------------------------------------------+
 | class com.demo                                 |
 +------------+-----------------------------------+
@@ -482,6 +545,47 @@ No method found matching the condition for current class.
 | parameters | [class java.lang.String, boolean] |
 +------------+-----------------------------------+
 ```
+
+If the [Freedom Conditions](#freedom-conditions) throw exceptions during filtering, these conditions will be marked with `[!]` in the table,
+and the members that threw exceptions and their complete exception stack traces will be listed below by condition name.
+
+If all members have been excluded by other conditions before reaching a freedom condition,
+this freedom condition will not be evaluated in this filtering, and it will be marked with `[-]` in the table.
+
+> The following example
+
+```kotlin
+Test::class.resolve()
+    .method {
+        // For methods whose return type is not an array, componentType is null,
+        // so a NullPointerException will be thrown here.
+        returnType { it.componentType.name == "java.lang.String" }
+        // All methods have been excluded by the condition above, so this condition will not be evaluated.
+        genericReturnType { it is ParameterizedType }
+    } // NoSuchMethodException will be thrown here.
+```
+
+The printed exception content is as follows.
+
+> The following example
+
+``` :no-line-numbers
+No method found matching the condition for the current class.
++------------------------------------------------------+
+| class com.demo                                       |
++----------------------------+-------------------------+
+| returnTypeCondition        | [!] (Runtime Condition) |
+| genericReturnTypeCondition | [-] (Runtime Condition) |
++----------------------------+-------------------------+
+Suggestion: ...
+[!] Exceptions thrown by runtime conditions:
+[returnTypeCondition]
+- public void com.demo.doTask(java.lang.String)
+java.lang.NullPointerException: ...
+    at ...
+```
+
+When using `optional()`, the WARN level log will also contain these contents.
 
 If you don't want KavaRef to throw or print anything, you can use `optional(silent = true)` to silently handle it,
 but we **do not recommend this**, which will mask the problem unless it is necessary.
@@ -523,11 +627,11 @@ If you want to turn off all log printing of KavaRef, you can set `KavaRef.logLev
 
 ::: tip
 
-On the JVM platform, KavaRef uses SLF4J as the implementation of log printing, and you can control log printing by configuring the implementation of SLF4J.
-
-By default, you only need to introduce `org.slf4j:slf4j-simple` as a dependency to complete the log provider implementation, and in projects such as SpringBoot, you do not need additional configuration.
+On the JVM platform, KavaRef prints logs to the standard error output (`System.err`) by default, you don't need to introduce any logging framework.
 
 On the Android platform, KavaRef uses `android.util.Log` as an implementation of log printing, and you don't need additional configuration.
+
+On any platform, the log level of KavaRef is only controlled by `KavaRef.logLevel`.
 
 :::
 
@@ -566,6 +670,9 @@ Then, set it to KavaRef.
 ```kotlin
 KavaRef.setLogger(MyLogger())
 ```
+
+If you need to integrate KavaRef logs into third-party logging frameworks such as SLF4J,
+you can find the corresponding integration methods in [here](../config/runtime-loggers.md).
 
 ### Advanced Usage
 
@@ -623,7 +730,10 @@ condition.parameters(String::class)
 val configuration = Test::class.java.createConfiguration(
     memberInstance = test, // Setting up instance.
     processorResolver = null, // Use the default resolver, refer to the "Custom Resolver" below.
-    superclass = false, // Whether to filter in superclass.
+    // Whether to filter in superclass, applies to all conditions using this configuration.
+    // NO means not to filter, NORMAL is the same as superclass(),
+    // INCLUDE_INTERFACES is the same as superclass(interfaces = true).
+    superclass = MemberCondition.Configuration.Superclass.NO,
     optional = MemberCondition.Configuration.Optional.NO // Configure optional conditions.
 )
 // Create and start filtering.
@@ -733,6 +843,90 @@ You can find some publicly maintained custom solvers in [here](../config/process
 
 :::
 
+### Custom Handler
+
+KavaRef uses the default `Member` handler for invocation and read/write operations.
+If you want to implement your own handler, you can customize the handler used by each `MemberResolver`.
+
+You can inherit from `MethodResolver.Handler`, `ConstructorResolver.Handler` or `FieldResolver.Handler` to implement your own handler.
+
+> The following example
+
+```kotlin
+class MyMethodHandler : MethodResolver.Handler() {
+
+    override fun invoke(method: Method, instance: Any?, args: Array<out Any?>): Any? {
+        // Intercept and implement your method invocation logic here.
+        return super.invoke(method, instance, args)
+    }
+}
+
+class MyFieldHandler : FieldResolver.Handler() {
+
+    override fun get(field: Field, instance: Any?): Any? {
+        // Intercept and implement your field reading logic here.
+        return super.get(field, instance)
+    }
+
+    override fun set(field: Field, instance: Any?, value: Any?) {
+        // Intercept and implement your field writing logic here.
+        super.set(field, instance, value)
+    }
+}
+
+class MyConstructorHandler : ConstructorResolver.Handler() {
+
+    override fun <T> newInstance(constructor: Constructor<T>, args: Array<out Any?>): T {
+        // Intercept and implement your instance creation logic here.
+        return super.newInstance(constructor, args)
+    }
+}
+```
+
+The handler calls `requireAccessible(member)` to make the member accessible before performing the operation,
+if you don't need this step, you can override it without calling `super`.
+
+> The following example
+
+```kotlin
+class MyMethodHandler : MethodResolver.Handler() {
+
+    override fun requireAccessible(member: Method) {
+        // Skip making the member accessible by not calling super.
+    }
+}
+```
+
+You can then use `withHandler(handler)` to set the handler.
+
+> The following example
+
+```kotlin
+// Suppose this is an instance of this Class.
+val test: Test
+// Call and execute using KavaRef.
+Test::class.resolve()
+    .firstMethod {
+        name = "doTask"
+        parameters(String::class)
+    }.of(test)
+    // Set custom handler.
+    .withHandler(MyMethodHandler())
+    .invoke("task_name")
+```
+
+::: warning
+
+`withHandler(handler)` does not modify the current `MemberResolver`, please use the `MemberResolver` it returns for subsequent operations.
+
+:::
+
+::: tip
+
+You can find some publicly maintained custom handlers in [here](../config/resolver-handlers.md) and define them in your project to use.
+
+:::
+
 ### About Cache
 
 Due to the diversity of filtering conditions, KavaRef does not directly provide caching function,
@@ -820,3 +1014,10 @@ public class Main {
     }
 }
 ```
+
+::: tip
+
+When calling `KavaRef.resolveObject(...)` in Java, the passed `Class` object will also be used as the instance without any compilation error,
+please use `KavaRef.resolveClass(...)` to reflect the members of a class.
+
+:::

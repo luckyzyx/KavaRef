@@ -19,11 +19,10 @@
  *
  * This file is created by fankes on 2025/5/16.
  */
-@file:Suppress("MemberVisibilityCanBePrivate")
+@file:Suppress("UNCHECKED_CAST")
 
 package com.highcapable.kavaref.resolver
 
-import com.highcapable.kavaref.extension.classOf
 import com.highcapable.kavaref.resolver.base.MemberResolver
 import java.lang.reflect.Constructor
 
@@ -31,12 +30,33 @@ import java.lang.reflect.Constructor
  * Resolving [Constructor].
  * @param self the member to be resolved.
  */
-class ConstructorResolver<T : Any> internal constructor(override val self: Constructor<T>) : MemberResolver<Constructor<T>, T>(self) {
+class ConstructorResolver<T : Any> internal constructor(
+    override val self: Constructor<T>
+) : MemberResolver<Constructor<T>, T, ConstructorResolver.Handler>(self) {
 
-    override fun copy() = ConstructorResolver(self)
+    private var handler = Handler()
 
     /**
-     * Create a new instance of the class represented by this constructor.
+     * Handler for performing the operations on [Constructor].
+     */
+    open class Handler : MemberResolver.Handler<Constructor<*>>() {
+
+        /**
+         * Creates a new instance with the [constructor] and the given [args].
+         * @see Constructor.newInstance
+         * @param constructor the constructor to invoke.
+         * @param args the arguments to pass to the constructor.
+         * @return [T]
+         */
+        open fun <T> newInstance(constructor: Constructor<T>, args: Array<out Any?>): T = constructor.newInstance(*args)
+    }
+
+    override fun withHandler(handler: Handler) = ConstructorResolver(self).also { it.handler = handler }
+
+    override fun copy() = ConstructorResolver(self).also { it.handler = handler }
+
+    /**
+     * Creates a new instance of the class represented by this constructor.
      * @see Constructor.newInstance
      * @see createQuietly
      * @see createAsType
@@ -44,24 +64,21 @@ class ConstructorResolver<T : Any> internal constructor(override val self: Const
      * @return [T]
      */
     fun create(vararg args: Any?): T {
-        requireAccessible()
-        return self.newInstance(*args)
+        handler.requireAccessible(self)
+        return handler.newInstance(self, args)
     }
 
     /**
-     * Create a new instance of the class represented by this constructor and cast it to the specified type [T].
+     * Creates a new instance of the class represented by this constructor and casts it to the specified type [T].
      * @see Constructor.newInstance
      * @see createAsTypeQuietly
      * @see createQuietly
      * @return [T]
      */
-    inline fun <reified T : Any> createAsType(vararg args: Any?): T {
-        requireAccessible()
-        return self.newInstance(*args) as? T ?: error("$this's instance cannot be cast to type ${classOf<T>()}.")
-    }
+    fun <T> createAsType(vararg args: Any?) = create(*args) as T
 
     /**
-     * Create a new instance of the class represented by this constructor and ignore any exceptions.
+     * Creates a new instance of the class represented by this constructor and ignores any exceptions.
      * @see Constructor.newInstance
      * @see create
      * @see createAsType
@@ -71,13 +88,13 @@ class ConstructorResolver<T : Any> internal constructor(override val self: Const
     fun createQuietly(vararg args: Any?) = runCatching { create(*args) }.getOrNull()
 
     /**
-     * Create a new instance of the class represented by this constructor and cast it to the
-     * specified type [T] and ignore any exceptions.
+     * Creates a new instance of the class represented by this constructor and casts it to the
+     * specified type [T] and ignores any exceptions.
      * @see Constructor.newInstance
      * @see create
      * @see createAsType
      * @see createQuietly
      * @return [T] or null.
      */
-    inline fun <reified T : Any> createAsTypeQuietly(vararg args: Any?) = runCatching { createAsType<T>(*args) }.getOrNull()
+    fun <T> createAsTypeQuietly(vararg args: Any?) = createQuietly(*args) as T?
 }
